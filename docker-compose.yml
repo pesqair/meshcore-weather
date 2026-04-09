@@ -1,0 +1,19 @@
+services:
+  meshcore-weather:
+    build: .
+    container_name: meshcore-weather
+    restart: unless-stopped
+    volumes:
+      - weather-data:/app/data
+    env_file:
+      - .env
+    environment:
+      # Connect to radio via TCP (socat on host bridges serial)
+      - MCW_SERIAL_PORT=tcp://host.docker.internal:4403
+      # Use host Ollama (has GPU access, much faster than Docker Ollama)
+      - MCW_OLLAMA_URL=http://host.docker.internal:11434/api/generate
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  weather-data:

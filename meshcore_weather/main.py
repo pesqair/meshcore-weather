@@ -1,10 +1,13 @@
 """Main entry point - wires EMWIN data, parser, and Meshcore radio together."""
 
 import asyncio
+import json
 import logging
+import re
 import signal
 import sys
 import time
+from pathlib import Path
 
 from meshcore_weather.config import settings
 from meshcore_weather.emwin.fetcher import create_source
@@ -48,22 +51,28 @@ VALID_STATES = set(STATE_NAMES.values())
 class WeatherBot:
     """Main application: bridges EMWIN weather data to Meshcore radio."""
 
+    _CONTACTS_FILE = Path(settings.data_dir) / "known_contacts.json"
+
     def __init__(self):
         self.emwin = create_source()
         self.radio = MeshcoreRadio()
         self.store = WeatherStore()
         self._running = False
         self._refresh_task: asyncio.Task | None = None
+        self._broadcaster = None  # MeshWXBroadcaster, created if data channel configured
         self._paging: dict[str, dict] = {}  # sender_key -> {full, offset, ts}
         self._rate_limit: dict[str, float] = {}
-        # Map sender names to pubkey prefixes learned from DMs
+        # Map sender names to pubkey prefixes — persisted to disk
         self._known_contacts: dict[str, str] = {}  # name -> pubkey_prefix
+        # Names where DM has failed — don't try again until they re-advert
+        self._dm_blocked: set[str] = set()
         # Track channel usage for unknown contacts
         self._channel_uses: dict[str, int] = {}  # sender_name -> count
         self._max_channel_replies = 3  # free channel replies before cutoff
         # Track consecutive channel msgs from known contacts (DM may not be working)
         self._dm_misses: dict[str, int] = {}  # sender_name -> consecutive ch msgs without DM
         self._max_dm_misses = 2  # after this many, assume DM isn't working
+        self._load_known_contacts()
 
     async def start(self) -> None:
         logger.info("Starting Meshcore Weather Bot")
@@ -83,6 +92,12 @@ class WeatherBot:
         self._running = True
         self._refresh_task = asyncio.create_task(self._refresh_loop())
 
+        # Start MeshWX binary broadcaster if data channel is configured
+        if self.radio.data_channel_idx is not None:
+            from meshcore_weather.protocol.broadcaster import MeshWXBroadcaster
+            self._broadcaster = MeshWXBroadcaster(self.store, self.radio)
+            await self._broadcaster.start()
+
         logger.info(
             "Weather bot is running. Listening on channel %d (%s) + DMs",
             self.radio.channel_idx,
@@ -92,6 +107,8 @@ class WeatherBot:
     async def stop(self) -> None:
         logger.info("Shutting down Weather Bot")
         self._running = False
+        if self._broadcaster:
+            await self._broadcaster.stop()
         if self._refresh_task:
             self._refresh_task.cancel()
             try:
@@ -140,9 +157,10 @@ class WeatherBot:
             self._dm_misses[sender] = misses
 
             if misses > self._max_dm_misses:
-                # DM isn't working — clear contact and fall back to channel
-                logger.info("%s sent %d channel msgs without DMing back — DM likely broken, using channel",
+                # DM isn't working — block until they re-advert
+                logger.info("%s sent %d channel msgs without DMing back — blocking DM, using channel",
                             sender, misses)
+                self._dm_blocked.add(sender)
                 self._known_contacts.pop(sender, None)
                 self._dm_misses.pop(sender, None)
                 await self._respond_channel(ch, sender, command, location)
@@ -162,10 +180,31 @@ class WeatherBot:
         if not self._rate_check(prefix):
             return
 
-        # They're DMing us — DMs work both ways, reset miss counter
+        # Parse @lat,lng prefix for location-aware commands
+        loc_match = re.match(r"^@(-?\d+\.?\d*),(-?\d+\.?\d*)\s+(.*)", text)
+        if loc_match:
+            lat = float(loc_match.group(1))
+            lon = float(loc_match.group(2))
+            text = loc_match.group(3)
+            if not hasattr(self, "_user_locations"):
+                self._user_locations = {}
+            self._user_locations[prefix] = (lat, lon)
+            logger.info("Cached location for %s: %.4f, %.4f", sender_name, lat, lon)
+
+        # They're DMing us — DMs work both ways, clear all blocks
         if sender_name and sender_name != "unknown":
+            is_new = sender_name not in self._known_contacts
             self._known_contacts[sender_name] = prefix
             self._dm_misses.pop(sender_name, None)
+            self._dm_blocked.discard(sender_name)
+            if is_new:
+                self._save_known_contacts()
+            self._channel_uses.pop(sender_name, None)
+
+        # MeshWX refresh request (e.g. "MWX310000")
+        if text.startswith("MWX") and len(text) >= 7 and self._broadcaster:
+            await self._handle_meshwx_refresh(text, prefix, sender_name)
+            return
 
         # Admin commands (DM-only, verified by pubkey)
         if self._is_admin(prefix):
@@ -177,25 +216,47 @@ class WeatherBot:
         await self._respond_dm(prefix, sender_name, command, location)
 
     async def _handle_advert(self, contact_name: str, pubkey_prefix: str) -> None:
-        """Handle a new advert — re-advert ourselves so they discover us, then greet."""
+        """Handle a new advert — only greet users who were using the channel."""
         prefix = self._normalize_key(pubkey_prefix)
 
-        # Remember this contact
+        # If they already DM us fine, just update the mapping — no greeting
+        if contact_name in self._known_contacts:
+            return
+
+        # Remember this new contact
         if contact_name and contact_name != "unknown":
             self._known_contacts[contact_name] = prefix
+            self._save_known_contacts()
 
-        # Re-advert so the user's device picks us up too (both sides need each other)
-        await self.radio._send_advert()
+        # Unblock DM if they were blocked
+        was_blocked = contact_name in self._dm_blocked
+        self._dm_blocked.discard(contact_name)
 
-        # If they were a channel user, welcome them to DM
+        # Only welcome users who were hitting the channel (they needed to advert)
         uses = self._channel_uses.pop(contact_name, 0)
-        if uses > 0:
-            logger.info("Advert from previous channel user %s — sending DM welcome", contact_name)
+        if uses > 0 or was_blocked:
+            # Re-advert so the user's device picks us up too
+            await self.radio._send_advert()
+            await asyncio.sleep(2)
+            logger.info("Advert from channel user %s — sending DM welcome", contact_name)
             await self.radio.send_dm(
                 prefix,
                 f"Hi {contact_name}! I can now reply via DM.\n"
                 "Send me wx/forecast/warn commands here."
             )
+
+    async def _handle_meshwx_refresh(self, text: str, prefix: str, sender_name: str) -> None:
+        """Handle a MeshWX refresh request DM (e.g. 'MWX310000')."""
+        try:
+            region_byte = int(text[3:5], 16)
+            region_id = (region_byte >> 4) & 0x0F
+            request_type = region_byte & 0x0F
+            client_newest = int(text[5:9], 16) if len(text) >= 9 else 0
+        except (ValueError, IndexError):
+            return
+        logger.info("MeshWX refresh from %s: region=0x%X type=%d newest=%d",
+                     sender_name, region_id, request_type, client_newest)
+        await self._broadcaster.broadcast_region(region_id, request_type)
 
     def _is_admin(self, pubkey_prefix: str) -> bool:
         admin = settings.admin_key.lower().strip()
@@ -315,15 +376,18 @@ class WeatherBot:
             )
             return
 
-        response, sender_key = self._get_response(command, location, sender)
+        response, sender_key, already_paginated = self._get_response(command, location, sender)
         if not response:
             return
 
-        chunk, offset, has_more = paginate(response, 0)
-        if has_more:
-            self._paging[sender_key] = {"full": response, "offset": offset, "ts": time.time()}
-        elif sender_key in self._paging:
-            del self._paging[sender_key]
+        if already_paginated:
+            chunk = response
+        else:
+            chunk, offset, has_more = paginate(response, 0)
+            if has_more:
+                self._paging[sender_key] = {"full": response, "offset": offset, "ts": time.time()}
+            elif sender_key in self._paging:
+                del self._paging[sender_key]
 
         logger.info("Response to %s (ch %d/%d): %s",
                      sender, uses, self._max_channel_replies,
@@ -342,26 +406,27 @@ class WeatherBot:
     async def _respond_dm(self, pubkey_prefix: str, sender_name: str, command: str, location: str) -> None:
         """Send response as a DM. Falls back to channel if DM fails."""
         sender_key = pubkey_prefix
-        response, sender_key = self._get_response(command, location, sender_key)
+        response, sender_key, already_paginated = self._get_response(command, location, sender_key)
         if not response:
             return
 
-        chunk, offset, has_more = paginate(response, 0)
-        if has_more:
-            self._paging[sender_key] = {"full": response, "offset": offset, "ts": time.time()}
-        elif sender_key in self._paging:
-            del self._paging[sender_key]
+        if already_paginated:
+            chunk = response
+        else:
+            chunk, offset, has_more = paginate(response, 0)
+            if has_more:
+                self._paging[sender_key] = {"full": response, "offset": offset, "ts": time.time()}
+            elif sender_key in self._paging:
+                del self._paging[sender_key]
 
         success = await self.radio.send_dm(pubkey_prefix, chunk)
         if success:
             logger.info("Response to %s (DM): %s", sender_name, chunk.replace("\n", " | "))
         else:
-            # DM failed — clear stale contact, advert ourselves, fall back to channel with nudge
-            logger.info("DM to %s failed, falling back to channel", sender_name)
-            self._known_contacts = {
-                k: v for k, v in self._known_contacts.items()
-                if v != pubkey_prefix
-            }
+            # DM failed — block further DM attempts until they re-advert
+            logger.info("DM to %s failed, blocking DM and falling back to channel", sender_name)
+            self._dm_blocked.add(sender_name)
+            self._known_contacts.pop(sender_name, None)
             self._dm_misses.pop(sender_name, None)
             await self.radio._send_advert()
             await self.radio.send_channel_message(self.radio.channel_idx, chunk)
@@ -371,15 +436,19 @@ class WeatherBot:
                 f"@[{sender_name}] Send an advert so I can reply via DM"
             )
 
-    def _get_response(self, command: str, location: str, sender_key: str) -> tuple[str | None, str]:
-        """Process command and handle pagination. Returns (response_text, sender_key)."""
+    def _get_response(self, command: str, location: str, sender_key: str) -> tuple[str | None, str, bool]:
+        """Process command and handle pagination.
+
+        Returns (response_text, sender_key, already_paginated).
+        If already_paginated is True, the caller should send as-is without re-paginating.
+        """
         now = time.time()
 
         # Clean expired paging sessions
         cutoff = now - 300
         self._paging = {k: v for k, v in self._paging.items() if v["ts"] > cutoff}
 
-        # Handle "more" pagination
+        # Handle "more" pagination — returns a ready-to-send chunk
         if command == "more":
             session = self._paging.get(sender_key)
             if session:
@@ -389,11 +458,11 @@ class WeatherBot:
                     session["ts"] = now
                 else:
                     del self._paging[sender_key]
-                return chunk, sender_key
-            return "No more data. Send a command first.", sender_key
+                return chunk, sender_key, True
+            return "No more data. Send a command first.", sender_key, True
 
         response = self._process_command(command, location)
-        return response, sender_key
+        return response, sender_key, False
 
     # -- Helpers --
 
@@ -404,6 +473,9 @@ class WeatherBot:
 
     def _resolve_sender_key(self, sender_name: str) -> str | None:
         """Try to find a pubkey prefix for a channel message sender so we can DM them."""
+        # Don't try DM for contacts where it has previously failed
+        if sender_name in self._dm_blocked:
+            return None
         # Check our learned contacts first
         if sender_name in self._known_contacts:
             return self._known_contacts[sender_name]
@@ -414,8 +486,24 @@ class WeatherBot:
             if pubkey:
                 prefix = self._normalize_key(pubkey)
                 self._known_contacts[sender_name] = prefix
+                self._save_known_contacts()
                 return prefix
         return None
+
+    def _load_known_contacts(self) -> None:
+        try:
+            if self._CONTACTS_FILE.exists():
+                self._known_contacts = json.loads(self._CONTACTS_FILE.read_text())
+                logger.info("Loaded %d known contacts from disk", len(self._known_contacts))
+        except Exception:
+            logger.debug("Could not load known contacts")
+
+    def _save_known_contacts(self) -> None:
+        try:
+            self._CONTACTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            self._CONTACTS_FILE.write_text(json.dumps(self._known_contacts))
+        except Exception:
+            logger.debug("Could not save known contacts")
 
     def _rate_check(self, sender_key: str) -> bool:
         now = time.time()

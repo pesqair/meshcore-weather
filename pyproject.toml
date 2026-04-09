@@ -22,6 +22,9 @@ dev = [
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
 ]
+radar = [
+    "Pillow>=10.0",
+]
 sdr = [
     "numpy>=1.26",
 ]

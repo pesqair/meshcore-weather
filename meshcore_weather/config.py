@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # Data storage
     data_dir: Path = Path("data")
 
+    # MeshWX binary data channel (empty = disabled)
+    meshwx_channel: str = ""
+    meshwx_broadcast_interval: int = 600  # seconds between broadcasts
+    meshwx_refresh_cooldown: int = 300    # min seconds between refresh per region
+
     # Admin: pubkey prefix of admin user (can run admin DM commands)
     admin_key: str = ""
 

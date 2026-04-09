@@ -27,6 +27,7 @@ class MeshcoreRadio:
         self._mc: MeshCore | None = None
         self._running = False
         self._channel_idx: int | None = None
+        self._data_channel_idx: int | None = None
         self._channel_handler: Callable | None = None
         self._dm_handler: Callable | None = None
         self._advert_handler: Callable | None = None
@@ -67,6 +68,15 @@ class MeshcoreRadio:
         # Resolve channel name to index
         self._channel_idx = await self._resolve_channel(settings.meshcore_channel)
         logger.info("Listening on channel %d (%s)", self._channel_idx, settings.meshcore_channel)
+
+        # Resolve data channel for MeshWX binary protocol (if configured)
+        if settings.meshwx_channel:
+            try:
+                self._data_channel_idx = await self._resolve_channel(settings.meshwx_channel)
+                logger.info("Data channel %d (%s)", self._data_channel_idx, settings.meshwx_channel)
+            except ValueError:
+                logger.warning("MeshWX data channel '%s' not found — binary broadcast disabled",
+                               settings.meshwx_channel)
 
         # Subscribe to channel messages, DMs, and new adverts
         self._mc.subscribe(EventType.CHANNEL_MSG_RECV, self._on_channel_msg)
@@ -142,6 +152,29 @@ class MeshcoreRadio:
             logger.debug("Sent to ch %d: %s", channel, text[:60])
         except Exception:
             logger.exception("Failed to send channel message")
+
+    async def send_binary_channel(self, payload: bytes) -> None:
+        """Send raw binary data on the MeshWX data channel.
+
+        Bypasses send_chan_msg (which UTF-8 encodes) by constructing
+        the channel message packet directly with raw bytes.
+        """
+        if not self._mc or self._data_channel_idx is None:
+            return
+        import time as _time
+        ts_bytes = int(_time.time()).to_bytes(4, "little")
+        data = (
+            b"\x03\x00"
+            + self._data_channel_idx.to_bytes(1, "little")
+            + ts_bytes
+            + payload
+        )
+        try:
+            await self._mc.commands.send(data, [EventType.OK, EventType.ERROR])
+            logger.debug("Binary sent on data ch %d: %d bytes (type 0x%02x)",
+                         self._data_channel_idx, len(payload), payload[0] if payload else 0)
+        except Exception:
+            logger.exception("Failed to send binary on data channel")
 
     async def send_dm(self, pubkey_prefix: str, text: str) -> bool:
         """Send a direct message to a contact by their public key prefix."""
@@ -271,3 +304,7 @@ class MeshcoreRadio:
     @property
     def channel_idx(self) -> int | None:
         return self._channel_idx
+
+    @property
+    def data_channel_idx(self) -> int | None:
+        return self._data_channel_idx

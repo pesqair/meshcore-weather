@@ -226,6 +226,32 @@ class LocationResolver:
             "lon": lon,
         }
 
+    def resolve_by_coords(self, lat: float, lon: float) -> dict | None:
+        """Resolve GPS coordinates to zone info (for location-aware DM)."""
+        self.load()
+        zones = self._nearest_zones(lat, lon, n=2)
+        if not zones:
+            return None
+        wfos = list({self._zones[z]["w"] for z in zones if z in self._zones})
+        station = self._nearest_station(lat, lon)
+        # Find nearest place name
+        best_place = None
+        best_d = float("inf")
+        for p in self._places:
+            d = _haversine(lat, lon, p[2], p[3])
+            if d < best_d:
+                best_d = d
+                best_place = p
+        name = f"{best_place[0].title()}, {best_place[1]}" if best_place else f"{lat:.2f}, {lon:.2f}"
+        return {
+            "zones": zones,
+            "wfos": wfos,
+            "station": station,
+            "name": name,
+            "lat": lat,
+            "lon": lon,
+        }
+
     def _nearest_zones(self, lat: float, lon: float, n: int = 2) -> list[str]:
         """Find the n nearest NWS zones by Haversine distance to centroids."""
         dists = []

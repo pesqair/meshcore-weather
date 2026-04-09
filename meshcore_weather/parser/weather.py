@@ -55,6 +55,73 @@ def paginate(text: str, offset: int = 0) -> tuple[str, int, bool]:
     return chunk, offset + len(cut), True
 
 
+def _expand_zone_ranges(text: str) -> set[str]:
+    """Expand NWS zone range notation like 'TXZ021>044' into individual zones.
+
+    Searches the first 25 lines of text for zone codes and ranges.
+    """
+    zones: set[str] = set()
+    for line in text.splitlines()[:25]:
+        s = line.strip()
+        # Match explicit zones and ranges: "TXZ021>044" or "TXZ192"
+        for m in re.finditer(r"([A-Z]{2}Z)(\d{3})(?:>(\d{3}))?", s):
+            prefix = m.group(1)
+            start = int(m.group(2))
+            end = int(m.group(3)) if m.group(3) else start
+            for n in range(start, end + 1):
+                zones.add(f"{prefix}{n:03d}")
+    return zones
+
+
+def extract_warning_polygon(text: str) -> list[tuple[float, float]]:
+    """Extract LAT...LON polygon vertices from an NWS warning product."""
+    coords: list[tuple[float, float]] = []
+    in_polygon = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if "LAT...LON" in stripped:
+            in_polygon = True
+            nums = re.findall(r"\d{4,5}", stripped.split("LAT...LON")[-1])
+            for j in range(0, len(nums) - 1, 2):
+                try:
+                    coords.append((int(nums[j]) / 100, -(int(nums[j + 1]) / 100)))
+                except (ValueError, IndexError):
+                    pass
+            continue
+        if in_polygon:
+            if not stripped or stripped.startswith("TIME") or stripped.startswith("$$"):
+                break
+            nums = re.findall(r"\d{4,5}", stripped)
+            for j in range(0, len(nums) - 1, 2):
+                try:
+                    coords.append((int(nums[j]) / 100, -(int(nums[j + 1]) / 100)))
+                except (ValueError, IndexError):
+                    pass
+    return coords
+
+
+def parse_vtec(text: str) -> dict | None:
+    """Parse VTEC line from an NWS warning product.
+
+    Returns dict with action, phenomenon, significance, and end time,
+    or None if no VTEC line found.
+    """
+    for line in text.splitlines()[:30]:
+        s = line.strip()
+        m = re.match(
+            r"/O\.(\w+)\.\w{4}\.(\w{2})\.(\w)\.\d{4}\.\d{6}T\d{4}Z-(\d{6}T\d{4}Z)/",
+            s,
+        )
+        if m:
+            return {
+                "action": m.group(1),
+                "phenomenon": m.group(2),
+                "significance": m.group(3),
+                "end": m.group(4),
+            }
+    return None
+
+
 def _age_str(ts: datetime) -> str:
     now = datetime.now(timezone.utc)
     secs = max(0, int((now - ts).total_seconds()))
@@ -254,7 +321,7 @@ class WeatherStore:
         if warnings:
             w = warnings[0]
             summary = self._extract_warning_headline(w.raw_text)
-            parts.append(f"!! {w.product_type}({_age_str(w.timestamp)}): {summary[:80]}")
+            parts.append(f"!! {w.product_type}({_age_str(w.timestamp)}): {summary}")
 
         # 2. Current conditions: try RWR city table first, fall back to METAR
         obs_found = False
@@ -302,9 +369,9 @@ class WeatherStore:
         if not warnings:
             return f"No active warnings for {loc['name']}."
         lines = [f"!! {len(warnings)} warn near {loc['name']}:"]
-        for w in warnings[:4]:
-            headline = self._extract_warning_headline(w.raw_text)
-            lines.append(f" {headline[:80]}")
+        for w in warnings:
+            headline = self._short_headline(w.raw_text)
+            lines.append(f" {headline}")
         return "\n".join(lines)
 
     def get_forecast(self, location: str) -> str:
@@ -537,25 +604,19 @@ class WeatherStore:
                 continue
             headline = self._short_headline(prod.raw_text)
             if state_filter:
-                warnings.append(headline[:120])
+                warnings.append(headline)
             else:
-                warnings.append(f"{st}: {headline[:60]}")
+                warnings.append(f"{st}: {headline}")
 
         label = state_filter if state_filter else "nationwide"
         if not warnings:
             return f"No active warnings {label}."
-        # Sort by state for readability
         warnings.sort()
-        limit = 8 if state_filter else 5
         lines = [f"!! {len(warnings)} warn {label}:"]
-        for w in warnings[:limit]:
+        for w in warnings:
             lines.append(f" {w}")
-        if len(warnings) > limit:
-            extra = len(warnings) - limit
-            if not state_filter:
-                lines.append(f" +{extra} more (warn <ST>)")
-            else:
-                lines.append(f" +{extra} more")
+        if not state_filter and len(warnings) > 5:
+            lines.append("warn <ST> for details")
         return "\n".join(lines)
 
     def scan_rain(self, state_filter: str = "") -> str:
@@ -607,10 +668,8 @@ class WeatherStore:
         if not rainy:
             return f"No rain reported {label}."
         lines = [f"Rain {label} ({len(rainy)} area(s)):"]
-        for r in rainy[:5]:
+        for r in rainy:
             lines.append(f" {r}")
-        if len(rainy) > 5:
-            lines.append(f" ...and {len(rainy) - 5} more")
         return "\n".join(lines)
 
     def get_outlook(self, location: str) -> str:
@@ -620,6 +679,21 @@ class WeatherStore:
             return f"Unknown location: {location}"
         origs = self._build_origs(loc)
         hwo = self._find_any_orig("HWO", origs)
+        # Fallback: try any HWO that covers this location's zones
+        if not hwo:
+            loc_zones = set(loc.get("zones", []))
+            if loc_zones:
+                best = None
+                for prod in self._products.values():
+                    if prod.product_type != "HWO":
+                        continue
+                    # Check if any of the product's zone codes match
+                    # HWO zone lines use ranges like "TXZ021>044"
+                    prod_zones = _expand_zone_ranges(prod.raw_text)
+                    if prod_zones and loc_zones & prod_zones:
+                        if best is None or prod.timestamp > best.timestamp:
+                            best = prod
+                hwo = best
         if not hwo:
             return f"No outlook available for {loc['name']}."
         summary = self._parse_hwo(hwo.raw_text)
@@ -680,7 +754,7 @@ class WeatherStore:
                 result.append(" " + p)
             else:
                 result.append(" " + p if result else p)
-        return "".join(result)[:500]
+        return "".join(result)
 
     def get_storm_reports(self, state_filter: str = "") -> str:
         """Get Local Storm Reports (LSR) - confirmed severe weather reports."""
@@ -705,10 +779,8 @@ class WeatherStore:
         if not reports:
             label = state_filter if state_filter else "nationwide"
             return f"No storm reports {label}."
-        total = len(reports)
-        reports = reports[:8]
         label = state_filter if state_filter else "nationwide"
-        lines = [f"Storm reports {label} ({total}):"]
+        lines = [f"Storm reports {label} ({len(reports)}):"]
         for r in reports:
             # Shorten event names for LoRa
             event = (r['event']
@@ -909,7 +981,7 @@ class WeatherStore:
             return ""
 
         # Return first period (e.g. "TODAY...Sunny with a high of 72.")
-        return forecast_parts[0][:250]
+        return forecast_parts[0]
 
     def _parse_afd_summary(self, text: str) -> str:
         """Extract summary from Area Forecast Discussion."""
@@ -944,7 +1016,7 @@ class WeatherStore:
                         continue
                     para.append(s)
                 if para:
-                    return " ".join(para)[:350]
+                    return " ".join(para)
         return ""
 
     @staticmethod
@@ -1052,39 +1124,9 @@ class WeatherStore:
 
     def _in_warning_polygon(self, text: str, lat: float, lon: float) -> bool:
         """Check if lat/lon is inside a warning's LAT...LON polygon."""
-        # Find LAT...LON line and extract coordinates
-        coords = []
-        in_polygon = False
-        for line in text.splitlines():
-            stripped = line.strip()
-            if "LAT...LON" in stripped:
-                in_polygon = True
-                # Extract coords from this line too
-                nums = re.findall(r"\d{4,5}", stripped.split("LAT...LON")[-1])
-                for j in range(0, len(nums) - 1, 2):
-                    try:
-                        plat = int(nums[j]) / 100
-                        plon = -(int(nums[j + 1]) / 100)
-                        coords.append((plat, plon))
-                    except (ValueError, IndexError):
-                        pass
-                continue
-            if in_polygon:
-                if not stripped or stripped.startswith("TIME") or stripped.startswith("$$"):
-                    break
-                nums = re.findall(r"\d{4,5}", stripped)
-                for j in range(0, len(nums) - 1, 2):
-                    try:
-                        plat = int(nums[j]) / 100
-                        plon = -(int(nums[j + 1]) / 100)
-                        coords.append((plat, plon))
-                    except (ValueError, IndexError):
-                        pass
-
+        coords = extract_warning_polygon(text)
         if len(coords) < 3:
             return True  # No polygon data = don't filter it out
-
-        # Ray-casting point-in-polygon
         return self._point_in_polygon(lat, lon, coords)
 
     @staticmethod

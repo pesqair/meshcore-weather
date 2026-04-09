@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     # Data storage
     data_dir: Path = Path("data")
 
+    # Admin: pubkey prefix of admin user (can run admin DM commands)
+    admin_key: str = ""
+
     # Logging
     log_level: str = "INFO"
 

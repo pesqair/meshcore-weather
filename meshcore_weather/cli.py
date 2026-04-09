@@ -147,6 +147,81 @@ def cmd_interactive():
     asyncio.run(_run())
 
 
+def cmd_contacts():
+    """List all contacts on the radio device."""
+    async def _run():
+        from meshcore_weather.meshcore.radio import MeshcoreRadio
+        radio = MeshcoreRadio()
+        await radio.start()
+
+        await radio._mc.ensure_contacts(follow=True)
+        contacts = radio._mc._contacts or []
+        if not contacts:
+            print("No contacts on device.")
+        else:
+            print(f"{len(contacts)} contact(s):\n")
+            for i, c in enumerate(contacts):
+                name = c.get("adv_name", "?")
+                key = c.get("public_key", "")[:12]
+                last = c.get("last_advert", 0)
+                print(f"  {i+1:3d}. {name:20s}  key={key}  last_advert={last}")
+        await radio.stop()
+
+    asyncio.run(_run())
+
+
+def cmd_remove_contact(name: str):
+    """Remove a contact from the radio device by name."""
+    async def _run():
+        from meshcore_weather.meshcore.radio import MeshcoreRadio
+        radio = MeshcoreRadio()
+        await radio.start()
+
+        await radio._mc.ensure_contacts(follow=True)
+        contact = radio._mc.get_contact_by_name(name)
+        if not contact:
+            print(f"Contact '{name}' not found.")
+            await radio.stop()
+            return
+
+        key = contact.get("public_key", "")
+        print(f"Removing: {contact.get('adv_name', '?')} (key={key[:12]})")
+        result = await radio._mc.commands.remove_contact(key)
+        print(f"Result: {result.type}")
+        await radio.stop()
+
+    asyncio.run(_run())
+
+
+def cmd_clear_contacts():
+    """Remove ALL contacts from the radio device."""
+    async def _run():
+        from meshcore_weather.meshcore.radio import MeshcoreRadio
+        radio = MeshcoreRadio()
+        await radio.start()
+
+        await radio._mc.ensure_contacts(follow=True)
+        contacts = radio._mc._contacts or []
+        if not contacts:
+            print("No contacts to remove.")
+            await radio.stop()
+            return
+
+        print(f"Removing {len(contacts)} contact(s)...")
+        for c in contacts:
+            name = c.get("adv_name", "?")
+            key = c.get("public_key", "")
+            try:
+                await radio._mc.commands.remove_contact(key)
+                print(f"  Removed: {name}")
+            except Exception as e:
+                print(f"  Failed to remove {name}: {e}")
+        await radio.stop()
+        print("Done.")
+
+    asyncio.run(_run())
+
+
 def main():
     logging.basicConfig(
         level=getattr(logging, settings.log_level.upper()),
@@ -157,9 +232,14 @@ def main():
         print("Usage: meshcore-weather-cli <command> [args]")
         print()
         print("Commands:")
-        print("  fetch              Fetch EMWIN products and show results")
-        print("  query <location>   Fetch data and query for a location")
-        print("  interactive        Simulate mesh commands from terminal")
+        print("  fetch                Fetch EMWIN products and show results")
+        print("  query <location>     Fetch data and query for a location")
+        print("  interactive          Simulate mesh commands from terminal")
+        print()
+        print("Radio admin:")
+        print("  contacts             List contacts on the radio device")
+        print("  remove <name>        Remove a contact by name")
+        print("  clear-contacts       Remove ALL contacts")
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -173,6 +253,15 @@ def main():
         cmd_query(" ".join(sys.argv[2:]))
     elif cmd == "interactive":
         cmd_interactive()
+    elif cmd == "contacts":
+        cmd_contacts()
+    elif cmd == "remove":
+        if len(sys.argv) < 3:
+            print("Usage: meshcore-weather-cli remove <contact name>")
+            sys.exit(1)
+        cmd_remove_contact(" ".join(sys.argv[2:]))
+    elif cmd == "clear-contacts":
+        cmd_clear_contacts()
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 
 from meshcore_weather.config import settings
 from meshcore_weather.emwin.fetcher import create_source
@@ -19,7 +20,8 @@ HELP_TEXT = (
     "wx = overview | wx <ST> = state\n"
     "wx/forecast/warn <city ST>\n"
     "outlook/rain/storm\n"
-    "metar/taf <ICAO> | more"
+    "metar/taf <ICAO> | more\n"
+    "DM me for private replies"
 )
 
 
@@ -52,7 +54,16 @@ class WeatherBot:
         self.store = WeatherStore()
         self._running = False
         self._refresh_task: asyncio.Task | None = None
-        self._paging: dict[str, dict] = {}  # sender -> {full, offset, ts}
+        self._paging: dict[str, dict] = {}  # sender_key -> {full, offset, ts}
+        self._rate_limit: dict[str, float] = {}
+        # Map sender names to pubkey prefixes learned from DMs
+        self._known_contacts: dict[str, str] = {}  # name -> pubkey_prefix
+        # Track channel usage for unknown contacts
+        self._channel_uses: dict[str, int] = {}  # sender_name -> count
+        self._max_channel_replies = 3  # free channel replies before cutoff
+        # Track consecutive channel msgs from known contacts (DM may not be working)
+        self._dm_misses: dict[str, int] = {}  # sender_name -> consecutive ch msgs without DM
+        self._max_dm_misses = 2  # after this many, assume DM isn't working
 
     async def start(self) -> None:
         logger.info("Starting Meshcore Weather Bot")
@@ -61,7 +72,9 @@ class WeatherBot:
         logger.info("  Channel: %s", settings.meshcore_channel)
 
         resolver.load()
-        self.radio.on_message(self._handle_message)
+        self.radio.on_channel_message(self._handle_channel_message)
+        self.radio.on_dm(self._handle_dm)
+        self.radio.on_advert(self._handle_advert)
 
         await self.emwin.start()
         await self.radio.start()
@@ -71,7 +84,7 @@ class WeatherBot:
         self._refresh_task = asyncio.create_task(self._refresh_loop())
 
         logger.info(
-            "Weather bot is running. Listening on channel %d (%s)",
+            "Weather bot is running. Listening on channel %d (%s) + DMs",
             self.radio.channel_idx,
             settings.meshcore_channel,
         )
@@ -99,76 +112,330 @@ class WeatherBot:
         if products:
             self.store.ingest(products)
 
-    async def _handle_message(self, channel: str, sender: str, text: str) -> None:
+    # -- Message handling --
+
+    async def _handle_channel_message(self, channel: str, sender: str, text: str) -> None:
+        """Handle a message received on a channel."""
         ch = int(channel)
-        # Strict channel guard: only respond on our dedicated channel, never ch 0 (public)
         if ch != self.radio.channel_idx or ch == 0:
             return
+
         text = text.strip()
         if not text:
             return
 
-        # Rate limiting: max 1 request per sender per 5 seconds
-        import time
-        now = time.time()
-        if not hasattr(self, '_rate_limit'):
-            self._rate_limit = {}
-        last = self._rate_limit.get(sender, 0)
-        if now - last < 5:
+        if not self._rate_check(sender):
             return
-        self._rate_limit[sender] = now
 
-        # Clean expired paging sessions (older than 5 minutes)
+        command, location = await self._parse(text)
+
+        # Try to resolve sender for DM; if unknown, advert so they can discover us
+        pubkey = self._resolve_sender_key(sender)
+        if not pubkey:
+            await self.radio._send_advert()
+        if pubkey:
+            # Track consecutive channel msgs — if they keep using the channel
+            # instead of DM, they probably aren't receiving our DMs
+            misses = self._dm_misses.get(sender, 0) + 1
+            self._dm_misses[sender] = misses
+
+            if misses > self._max_dm_misses:
+                # DM isn't working — clear contact and fall back to channel
+                logger.info("%s sent %d channel msgs without DMing back — DM likely broken, using channel",
+                            sender, misses)
+                self._known_contacts.pop(sender, None)
+                self._dm_misses.pop(sender, None)
+                await self._respond_channel(ch, sender, command, location)
+            else:
+                self._channel_uses.pop(sender, None)
+                await self._respond_dm(pubkey, sender, command, location)
+        else:
+            await self._respond_channel(ch, sender, command, location)
+
+    async def _handle_dm(self, pubkey_prefix: str, sender_name: str, text: str) -> None:
+        """Handle a direct message."""
+        text = text.strip()
+        if not text:
+            return
+
+        prefix = self._normalize_key(pubkey_prefix)
+        if not self._rate_check(prefix):
+            return
+
+        # They're DMing us — DMs work both ways, reset miss counter
+        if sender_name and sender_name != "unknown":
+            self._known_contacts[sender_name] = prefix
+            self._dm_misses.pop(sender_name, None)
+
+        # Admin commands (DM-only, verified by pubkey)
+        if self._is_admin(prefix):
+            result = await self._handle_admin(text, prefix, sender_name)
+            if result is not None:
+                return
+
+        command, location = await self._parse(text)
+        await self._respond_dm(prefix, sender_name, command, location)
+
+    async def _handle_advert(self, contact_name: str, pubkey_prefix: str) -> None:
+        """Handle a new advert — re-advert ourselves so they discover us, then greet."""
+        prefix = self._normalize_key(pubkey_prefix)
+
+        # Remember this contact
+        if contact_name and contact_name != "unknown":
+            self._known_contacts[contact_name] = prefix
+
+        # Re-advert so the user's device picks us up too (both sides need each other)
+        await self.radio._send_advert()
+
+        # If they were a channel user, welcome them to DM
+        uses = self._channel_uses.pop(contact_name, 0)
+        if uses > 0:
+            logger.info("Advert from previous channel user %s — sending DM welcome", contact_name)
+            await self.radio.send_dm(
+                prefix,
+                f"Hi {contact_name}! I can now reply via DM.\n"
+                "Send me wx/forecast/warn commands here."
+            )
+
+    def _is_admin(self, pubkey_prefix: str) -> bool:
+        admin = settings.admin_key.lower().strip()
+        return bool(admin) and pubkey_prefix.startswith(admin)
+
+    async def _handle_admin(self, text: str, prefix: str, sender_name: str) -> str | None:
+        """Handle admin commands. Returns response string, or None if not an admin command."""
+        parts = text.strip().split(None, 1)
+        cmd = parts[0].lower() if parts else ""
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd == "contacts":
+            await self.radio._mc.ensure_contacts(follow=True)
+            contacts = self.radio._mc._contacts or {}
+            if not contacts:
+                reply = "No contacts on device."
+            else:
+                lines = [f"{len(contacts)} contacts:"]
+                for c in contacts.values():
+                    name = c.get("adv_name", "?")
+                    key = c.get("public_key", "")[:12]
+                    lines.append(f" {name} ({key})")
+                reply = "\n".join(lines)
+            await self._send_dm_paginated(prefix, sender_name, reply)
+            return reply
+
+        if cmd == "remove" and arg:
+            await self.radio._mc.ensure_contacts(follow=True)
+            contact = self.radio._mc.get_contact_by_name(arg)
+            if not contact:
+                await self.radio.send_dm(prefix, f"Contact '{arg}' not found.")
+                return "not found"
+            key = contact.get("public_key", "")
+            name = contact.get("adv_name", "?")
+            # Confirm before removing (can't DM after delete)
+            is_self = self._normalize_key(key) == prefix
+            if is_self:
+                await self.radio.send_dm(prefix, f"Removing: {name} (you). Re-advert to reconnect.")
+            else:
+                await self.radio.send_dm(prefix, f"Removing: {name}")
+            try:
+                await self.radio._mc.commands.remove_contact(key)
+                self._known_contacts.pop(name, None)
+                logger.info("Admin %s removed contact: %s", sender_name, name)
+            except Exception as e:
+                logger.warning("Failed to remove %s: %s", name, e)
+            return "removed"
+
+        if cmd == "clear-contacts":
+            await self.radio._mc.ensure_contacts(follow=True)
+            contacts = self.radio._mc._contacts or {}
+            if not contacts:
+                await self.radio.send_dm(prefix, "No contacts to remove.")
+                return "empty"
+            contact_list = list(contacts.values())
+            await self.radio.send_dm(prefix, f"Clearing {len(contact_list)} contacts. Re-advert to reconnect.")
+            removed = 0
+            for c in contact_list:
+                try:
+                    await self.radio._mc.commands.remove_contact(c["public_key"])
+                    self._known_contacts.pop(c.get("adv_name", ""), None)
+                    removed += 1
+                except Exception:
+                    pass
+            logger.info("Admin %s cleared %d/%d contacts", sender_name, removed, len(contact_list))
+            return "cleared"
+
+        if cmd == "advert":
+            await self.radio._send_advert()
+            await self.radio._mc.ensure_contacts(follow=True)
+            await self.radio.send_dm(prefix, "Advert sent + contacts refreshed.")
+            return "advert"
+
+        if cmd == "refresh":
+            await self.radio._mc.ensure_contacts(follow=True)
+            count = len(self.radio._mc._contacts or [])
+            await self.radio.send_dm(prefix, f"Contacts refreshed: {count} contacts.")
+            return "refresh"
+
+        if cmd == "admin":
+            reply = (
+                "Admin commands (DM only):\n"
+                "contacts - list device contacts\n"
+                "remove <name> - remove contact\n"
+                "clear-contacts - remove all\n"
+                "advert - send advert now\n"
+                "refresh - reload contacts"
+            )
+            await self._send_dm_paginated(prefix, sender_name, reply)
+            return reply
+
+        return None  # Not an admin command, fall through to normal handling
+
+    async def _send_dm_paginated(self, pubkey: str, sender_name: str, text: str) -> None:
+        """Send a potentially long response as paginated DMs."""
+        chunk, offset, has_more = paginate(text, 0)
+        if has_more:
+            self._paging[pubkey] = {"full": text, "offset": offset, "ts": time.time()}
+        await self.radio.send_dm(pubkey, chunk)
+
+    # -- Response methods --
+
+    async def _respond_channel(self, channel: int, sender: str, command: str, location: str) -> None:
+        """Send response on the channel for unknown contacts.
+
+        Allows a few free replies, then asks them to advert for DM.
+        Every reply includes a DM nudge that gets more insistent.
+        """
+        uses = self._channel_uses.get(sender, 0) + 1
+        self._channel_uses[sender] = uses
+
+        if uses > self._max_channel_replies:
+            await self.radio.send_channel_message(
+                channel,
+                f"@[{sender}] Please send an advert so I can DM you. "
+                "Channel replies are limited to reduce spam."
+            )
+            return
+
+        response, sender_key = self._get_response(command, location, sender)
+        if not response:
+            return
+
+        chunk, offset, has_more = paginate(response, 0)
+        if has_more:
+            self._paging[sender_key] = {"full": response, "offset": offset, "ts": time.time()}
+        elif sender_key in self._paging:
+            del self._paging[sender_key]
+
+        logger.info("Response to %s (ch %d/%d): %s",
+                     sender, uses, self._max_channel_replies,
+                     chunk.replace("\n", " | "))
+        await self.radio.send_channel_message(channel, chunk)
+
+        # Append DM nudge after a brief delay (radio needs time between sends)
+        await asyncio.sleep(2)
+        if uses == 1:
+            nudge = f"@[{sender}] Tip: send an advert & DM me for private replies"
+        else:
+            nudge = f"@[{sender}] Send an advert so I can reply via DM ({self._max_channel_replies - uses} ch replies left)"
+        logger.info("Nudge to %s: %s", sender, nudge)
+        await self.radio.send_channel_message(channel, nudge)
+
+    async def _respond_dm(self, pubkey_prefix: str, sender_name: str, command: str, location: str) -> None:
+        """Send response as a DM. Falls back to channel if DM fails."""
+        sender_key = pubkey_prefix
+        response, sender_key = self._get_response(command, location, sender_key)
+        if not response:
+            return
+
+        chunk, offset, has_more = paginate(response, 0)
+        if has_more:
+            self._paging[sender_key] = {"full": response, "offset": offset, "ts": time.time()}
+        elif sender_key in self._paging:
+            del self._paging[sender_key]
+
+        success = await self.radio.send_dm(pubkey_prefix, chunk)
+        if success:
+            logger.info("Response to %s (DM): %s", sender_name, chunk.replace("\n", " | "))
+        else:
+            # DM failed — clear stale contact, advert ourselves, fall back to channel with nudge
+            logger.info("DM to %s failed, falling back to channel", sender_name)
+            self._known_contacts = {
+                k: v for k, v in self._known_contacts.items()
+                if v != pubkey_prefix
+            }
+            self._dm_misses.pop(sender_name, None)
+            await self.radio._send_advert()
+            await self.radio.send_channel_message(self.radio.channel_idx, chunk)
+            await asyncio.sleep(2)
+            await self.radio.send_channel_message(
+                self.radio.channel_idx,
+                f"@[{sender_name}] Send an advert so I can reply via DM"
+            )
+
+    def _get_response(self, command: str, location: str, sender_key: str) -> tuple[str | None, str]:
+        """Process command and handle pagination. Returns (response_text, sender_key)."""
+        now = time.time()
+
+        # Clean expired paging sessions
         cutoff = now - 300
         self._paging = {k: v for k, v in self._paging.items() if v["ts"] > cutoff}
 
-        # Input sanitization: limit length, strip control chars
-        text = text[:200]
-        text = "".join(c for c in text if c.isprintable() or c in "\n ")
-
-        # Parse intent via local LLM (or rigid fallback)
-        intent = await parse_intent(text)
-        command = intent["command"]
-        location = intent["location"]
-
-        # Sanitize location output from LLM - only allow safe chars
-        location = "".join(c for c in location if c.isalnum() or c in " ,.-'")[:50]
-
         # Handle "more" pagination
         if command == "more":
-            session = self._paging.get(sender)
+            session = self._paging.get(sender_key)
             if session:
                 chunk, new_offset, has_more = paginate(session["full"], session["offset"])
                 if has_more:
                     session["offset"] = new_offset
                     session["ts"] = now
                 else:
-                    del self._paging[sender]
-                logger.info("More to %s: %s", sender, chunk.replace("\n", " | "))
-                await self.radio.send_channel_message(int(channel), chunk)
-            else:
-                await self.radio.send_channel_message(
-                    int(channel), "No more data. Send a command first."
-                )
-            return
+                    del self._paging[sender_key]
+                return chunk, sender_key
+            return "No more data. Send a command first.", sender_key
 
         response = self._process_command(command, location)
-        if response:
-            chunk, offset, has_more = paginate(response, 0)
-            if has_more:
-                self._paging[sender] = {
-                    "full": response,
-                    "offset": offset,
-                    "ts": now,
-                }
-            elif sender in self._paging:
-                del self._paging[sender]
-            logger.info("Response to %s: %s", sender, chunk.replace("\n", " | "))
-            await self.radio.send_channel_message(int(channel), chunk)
+        return response, sender_key
+
+    # -- Helpers --
+
+    @staticmethod
+    def _normalize_key(key: str) -> str:
+        """Normalize a pubkey to 12-char prefix for consistent session keying."""
+        return key[:12].lower()
+
+    def _resolve_sender_key(self, sender_name: str) -> str | None:
+        """Try to find a pubkey prefix for a channel message sender so we can DM them."""
+        # Check our learned contacts first
+        if sender_name in self._known_contacts:
+            return self._known_contacts[sender_name]
+        # Try the device's contact list
+        contact = self.radio.find_contact_by_name(sender_name)
+        if contact:
+            pubkey = contact.get("public_key", "")
+            if pubkey:
+                prefix = self._normalize_key(pubkey)
+                self._known_contacts[sender_name] = prefix
+                return prefix
+        return None
+
+    def _rate_check(self, sender_key: str) -> bool:
+        now = time.time()
+        last = self._rate_limit.get(sender_key, 0)
+        if now - last < 5:
+            return False
+        self._rate_limit[sender_key] = now
+        return True
+
+    async def _parse(self, text: str) -> tuple[str, str]:
+        text = text[:200]
+        text = "".join(c for c in text if c.isprintable() or c in "\n ")
+        intent = await parse_intent(text)
+        command = intent["command"]
+        location = intent["location"]
+        location = "".join(c for c in location if c.isalnum() or c in " ,.-'")[:50]
+        return command, location
 
     @staticmethod
     def _to_state_code(text: str) -> str | None:
-        """Convert state name or abbreviation to 2-letter code, or None."""
         t = text.strip()
         if len(t) == 2 and t.upper() in VALID_STATES:
             return t.upper()
@@ -180,8 +447,6 @@ class WeatherBot:
     def _process_command(self, command: str, location: str) -> str | None:
         if command == "help":
             return HELP_TEXT
-
-        # --- Navigation: bare commands show overview, state narrows, city gets detail ---
 
         if command == "wx":
             if not location:

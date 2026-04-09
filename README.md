@@ -13,8 +13,19 @@ NOAA Internet ──────────────────────
 
 1. **EMWIN data** is fetched from NOAA internet servers (with a future path to direct satellite downlink via SDR)
 2. **Weather products** (forecasts, warnings, observations, storm reports) are parsed and indexed by location
-3. **Meshcore radio** receives user requests over the configured channel and responds with paginated weather data
+3. **Meshcore radio** receives user requests via channel or DM and responds with paginated weather data
 4. **Product cache** persists to disk so data survives restarts
+
+## Direct Messages
+
+The bot supports a hybrid channel/DM system to reduce channel spam:
+
+1. **New users** send commands on the channel and get a few free replies, along with a prompt to send an advert
+2. **When a user adverts**, the bot detects it immediately, re-adverts itself (so both sides discover each other), and sends a DM welcome
+3. **Once connected**, all responses go via DM automatically — even if the user sends commands on the channel
+4. **If DMs break** (e.g. user deletes the bot from contacts), the bot detects the failure after 2 attempts and falls back to channel with a nudge to re-advert
+
+The bot advertises itself on startup and every 15 minutes, and also immediately when an unknown user sends a channel message.
 
 ## Mesh Commands
 
@@ -80,13 +91,26 @@ user: more
 bot:  WEDNESDAY...Sunny. Highs in the mid 80s. South winds 5 to 10 mph.
 ```
 
+## Admin Commands
+
+Admin commands are available via DM only, authenticated by pubkey prefix (`MCW_ADMIN_KEY`):
+
+| Command | Description |
+|---------|-------------|
+| `admin` | Show admin help |
+| `contacts` | List all contacts on the radio device |
+| `remove <name>` | Remove a specific contact by name |
+| `clear-contacts` | Remove ALL contacts from the device |
+| `advert` | Send a flood advert + refresh contacts |
+| `refresh` | Reload contacts from the device |
+
 ## Quick Start
 
 ### With Docker (recommended)
 
 ```bash
 cp .env.example .env
-# Edit .env with your serial port and channel
+# Edit .env with your serial port, channel, and admin key
 
 docker compose up -d
 ```
@@ -111,6 +135,17 @@ pip install -e ".[dev]"
 meshcore-weather-cli interactive
 ```
 
+### CLI Tools
+
+```bash
+meshcore-weather-cli fetch              # Fetch EMWIN products from NOAA
+meshcore-weather-cli query "Austin TX"  # Query weather data
+meshcore-weather-cli interactive        # Simulate mesh commands
+meshcore-weather-cli contacts           # List radio contacts
+meshcore-weather-cli remove <name>      # Remove a contact
+meshcore-weather-cli clear-contacts     # Remove all contacts
+```
+
 ## Configuration
 
 All configuration is via environment variables (or `.env` file), prefixed with `MCW_`:
@@ -123,21 +158,26 @@ All configuration is via environment variables (or `.env` file), prefixed with `
 | `MCW_EMWIN_SOURCE` | `internet` | Data source: `internet` or `sdr` (future) |
 | `MCW_EMWIN_POLL_INTERVAL` | `120` | Refresh interval in seconds |
 | `MCW_EMWIN_MAX_AGE_HOURS` | `12` | Expire products older than this |
+| `MCW_ADMIN_KEY` | *(empty)* | Pubkey prefix of admin user (enables admin DM commands) |
 | `MCW_LOG_LEVEL` | `INFO` | Log level |
 
 ## Safety
 
 - **Channel isolation**: The bot will never transmit on channel 0 (public) or any channel other than its configured one. This is enforced at both the message handler and radio driver layers.
+- **DM fallback**: If DMs fail, the bot detects it and falls back to channel responses gracefully.
+- **Channel spam limits**: Unknown contacts get 3 free channel replies, then must advert for DM access.
 - **Rate limiting**: Max 1 request per sender per 5 seconds.
 - **Input sanitization**: Commands are length-limited and stripped of control characters.
+- **Admin authentication**: Admin commands require matching pubkey prefix — cannot be spoofed via channel.
 
 ## Architecture
 
 ```
 meshcore_weather/
 ├── config.py           # Settings from env vars
-├── main.py             # App entry point, command routing, pagination
+├── main.py             # App entry point, command routing, DM/channel hybrid
 ├── nlp.py              # Command parser with typo tolerance
+├── cli.py              # CLI tools for testing and radio admin
 ├── emwin/
 │   └── fetcher.py      # EMWIN data sources (internet / SDR), disk cache
 ├── geodata/
@@ -146,7 +186,7 @@ meshcore_weather/
 │   ├── places.json     # 32,333 US Census places
 │   └── stations.json   # 2,237 METAR stations
 ├── meshcore/
-│   └── radio.py        # Meshcore radio interface with channel guard
+│   └── radio.py        # Radio interface: channel, DM, adverts, contacts
 └── parser/
     └── weather.py      # NWS product parsing, queries, pagination
 ```
@@ -156,7 +196,7 @@ meshcore_weather/
 The bot ingests ~90 types of EMWIN products including:
 
 - **ZFP** — Zone Forecast Products (detailed local forecasts)
-- **AFD** — Area Forecast Discussions (meteorologist analysis)
+- **AFD** — Area Forecast Discussions (meteorologist analysis, key messages)
 - **HWO** — Hazardous Weather Outlook (1-7 day threats)
 - **RWR** — Regional Weather Roundup (current conditions tables)
 - **SAH** — METAR observations
@@ -175,6 +215,9 @@ The bot ingests ~90 types of EMWIN products including:
 - [x] Warning filtering (cancelled/expired detection via VTEC)
 - [x] Persistent product cache across restarts
 - [x] 3-letter airport code support
+- [x] Hybrid DM/channel messaging with auto-discovery
+- [x] Admin commands via authenticated DM
+- [x] Channel spam limiting with advert nudges
 - [ ] SDR satellite downlink via goesrecv/goestools
 - [ ] Position-based auto weather (use Meshcore GPS data)
 - [ ] Weather alerts push (broadcast warnings to channel)

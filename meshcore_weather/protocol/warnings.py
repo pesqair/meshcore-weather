@@ -1,14 +1,15 @@
 """Extract active warnings from WeatherStore and pack as MeshWX binary messages."""
 
 import logging
-import re
 from datetime import datetime, timezone
 
 from meshcore_weather.parser.weather import (
     WeatherStore,
+    _expand_zone_ranges,
     extract_warning_polygon,
     parse_vtec,
 )
+from meshcore_weather.protocol.coverage import Coverage
 from meshcore_weather.protocol.meshwx import (
     PRODUCT_TYPE_MAP,
     VTEC_SEVERITY_MAP,
@@ -41,15 +42,22 @@ def _vtec_end_to_minutes(end_str: str) -> int:
         return 120  # default 2 hours
 
 
-def extract_active_warnings(store: WeatherStore) -> list[dict]:
+def extract_active_warnings(
+    store: WeatherStore,
+    coverage: Coverage | None = None,
+) -> list[dict]:
     """Extract all active warnings with polygons from the store.
 
+    If `coverage` is provided and non-empty, warnings are filtered to only
+    those affecting the coverage zones (by zone code first, polygon fallback).
+
     Returns list of dicts with keys:
-        warning_type, severity, expiry_minutes, vertices, headline
+        warning_type, severity, expiry_minutes, vertices, headline, zones
     """
     warn_types = {"SVS", "SPS", "NPW", "FLS", "FLW", "WSW", "SWO", "MWS", "DSW", "EWW", "SQW"}
     results = []
     seen = set()
+    filter_active = coverage is not None and not coverage.is_empty()
 
     for prod in sorted(store._products.values(), key=lambda p: p.timestamp, reverse=True):
         if prod.product_type not in warn_types:
@@ -65,6 +73,19 @@ def extract_active_warnings(store: WeatherStore) -> list[dict]:
         vertices = extract_warning_polygon(prod.raw_text)
         if len(vertices) < 3:
             continue  # no polygon, can't broadcast as binary
+
+        # Extract affected zones from the UGC line (supports TXZ021>044 ranges)
+        zones = _expand_zone_ranges(prod.raw_text)
+
+        # Apply coverage filter if set
+        if filter_active:
+            # Fast path: zone code intersection
+            if zones and coverage.covers_any(zones):
+                pass  # accepted
+            elif coverage.covers_polygon(vertices):
+                pass  # accepted via polygon geometry
+            else:
+                continue  # outside coverage, skip
 
         # Determine warning type nibble
         wtype = PRODUCT_TYPE_MAP.get(prod.product_type, WARN_OTHER)
@@ -87,6 +108,7 @@ def extract_active_warnings(store: WeatherStore) -> list[dict]:
             "expiry_minutes": expiry,
             "vertices": vertices,
             "headline": headline,
+            "zones": sorted(zones),
         })
 
     return results

@@ -31,8 +31,14 @@ class Settings(BaseSettings):
 
     # MeshWX binary data channel (empty = disabled)
     meshwx_channel: str = ""
-    meshwx_broadcast_interval: int = 600  # seconds between broadcasts
+    meshwx_broadcast_interval: int = 3600  # seconds between broadcasts
     meshwx_refresh_cooldown: int = 300    # min seconds between refresh per region
+
+    # Coverage targeting — bot broadcasts only data affecting these areas.
+    # Comma-separated lists, all optional, all additive (union). Empty = broadcast everything.
+    home_cities: str = ""  # e.g. "Austin TX,San Antonio TX,Dallas TX"
+    home_states: str = ""  # e.g. "TX,OK"
+    home_wfos: str = ""    # e.g. "EWX,FWD,HGX"
 
     # Admin: pubkey prefix of admin user (can run admin DM commands)
     admin_key: str = ""

@@ -9,6 +9,7 @@ import httpx
 from meshcore_weather.config import settings
 from meshcore_weather.meshcore.radio import MeshcoreRadio
 from meshcore_weather.parser.weather import WeatherStore
+from meshcore_weather.protocol.coverage import Coverage
 from meshcore_weather.protocol.meshwx import cobs_encode
 from meshcore_weather.protocol.radar import fetch_radar_composite, build_radar_messages
 from meshcore_weather.protocol.warnings import extract_active_warnings, warnings_to_binary
@@ -30,10 +31,21 @@ class MeshWXBroadcaster:
         self._last_refresh: dict[int, float] = {}  # region_id -> timestamp
         self._http_client: httpx.AsyncClient | None = None
         self._latest_radar: tuple[bytes, int] | None = None  # (img_bytes, ts_min)
+        self._coverage: Coverage = Coverage.empty()
+
+    def reload_coverage(self) -> None:
+        """Rebuild coverage from current settings. Called on startup + config changes."""
+        self._coverage = Coverage.from_config()
+        logger.info("Coverage: %s", self._coverage.summary())
+
+    @property
+    def coverage(self) -> Coverage:
+        return self._coverage
 
     async def start(self) -> None:
         self._running = True
         self._http_client = httpx.AsyncClient(timeout=30.0)
+        self.reload_coverage()
         self._task = asyncio.create_task(self._broadcast_loop())
         logger.info("MeshWX broadcaster started (interval=%ds)", settings.meshwx_broadcast_interval)
 
@@ -75,12 +87,13 @@ class MeshWXBroadcaster:
             self._latest_radar = result
 
     async def _broadcast_radar(self) -> int:
-        """Fetch and broadcast COBS-encoded radar grids."""
+        """Fetch and broadcast COBS-encoded radar grids (filtered by coverage)."""
         await self._fetch_radar()
         if not self._latest_radar:
             return 0
         img_data, ts_min = self._latest_radar
-        msgs = build_radar_messages(img_data, ts_min)
+        region_ids = self._coverage.region_ids if not self._coverage.is_empty() else None
+        msgs = build_radar_messages(img_data, ts_min, region_ids=region_ids)
         sent = 0
         for msg in msgs:
             await self.radio.send_binary_channel(cobs_encode(msg))
@@ -89,8 +102,8 @@ class MeshWXBroadcaster:
         return sent
 
     async def _broadcast_warnings(self) -> int:
-        """Broadcast COBS-encoded warning polygons."""
-        warnings = extract_active_warnings(self.store)
+        """Broadcast COBS-encoded warning polygons (filtered by coverage)."""
+        warnings = extract_active_warnings(self.store, coverage=self._coverage)
         msgs = warnings_to_binary(warnings)
         sent = 0
         for msg in msgs:

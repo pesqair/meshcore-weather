@@ -151,11 +151,19 @@ async def fetch_radar_composite(client: httpx.AsyncClient) -> tuple[bytes, int] 
 
 
 def build_radar_messages(
-    img_data: bytes, timestamp_utc_min: int
+    img_data: bytes,
+    timestamp_utc_min: int,
+    region_ids: set[int] | None = None,
 ) -> list[bytes]:
-    """Build MeshWX radar grid messages for all regions with precipitation."""
+    """Build MeshWX radar grid messages for regions with precipitation.
+
+    If `region_ids` is provided, only those regions are considered.
+    Regions with no precipitation are always skipped.
+    """
     messages = []
     for region_id, region in REGIONS.items():
+        if region_ids is not None and region_id not in region_ids:
+            continue
         grid = extract_region_grid(img_data, region_id)
         if grid is None:
             continue  # no precip or region not applicable

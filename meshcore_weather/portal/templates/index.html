@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Meshcore Weather Portal{% endblock %}
+{% block content %}
+<h1 class="page-title">Dashboard</h1>
+<p class="page-subtitle">Overview of this bot's coverage area, data, and mesh activity.</p>
+
+<div class="grid grid-4 mb-4">
+  <div class="stat">
+    <div class="stat-label">Coverage Zones</div>
+    <div class="stat-value">
+      {% if coverage and not coverage.is_empty() %}{{ coverage.zones|length }}{% else %}All{% endif %}
+    </div>
+    <div class="stat-hint">
+      {% if coverage and not coverage.is_empty() %}
+        Filtered broadcast
+      {% else %}
+        No filter set
+      {% endif %}
+    </div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Radar Regions</div>
+    <div class="stat-value">
+      {% if coverage and not coverage.is_empty() %}{{ coverage.region_ids|length }}{% else %}10{% endif %}
+    </div>
+    <div class="stat-hint">MeshWX grids being broadcast</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">EMWIN Products</div>
+    <div class="stat-value">{{ product_count }}</div>
+    <div class="stat-hint">In store (last 12h)</div>
+  </div>
+  <div class="stat">
+    <div class="stat-label">Data Channel</div>
+    <div class="stat-value">
+      {% if data_channel is not none %}
+        <span class="dot dot-green"></span>#{{ data_channel }}
+      {% else %}
+        <span class="dot dot-gray"></span>Off
+      {% endif %}
+    </div>
+    <div class="stat-hint">MeshWX binary broadcast</div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <div>
+      <div class="card-title">Current Coverage</div>
+      <div class="card-subtitle">What warnings and radar will be broadcast</div>
+    </div>
+    <a href="/config" class="btn btn-primary">Edit Region</a>
+  </div>
+  <p class="text-small">
+    {% if coverage and not coverage.is_empty() %}
+      {{ coverage.summary() }}
+    {% else %}
+      <span class="text-muted">No coverage filter set. The bot is broadcasting data for the entire CONUS. Set a specific region on the
+      <a href="/config">Region page</a> to save airtime.</span>
+    {% endif %}
+  </p>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <div>
+      <div class="card-title">Quick Actions</div>
+    </div>
+  </div>
+  <div class="flex gap-2">
+    <button class="btn" hx-post="/api/actions/broadcast" hx-swap="none">
+      Broadcast Now
+    </button>
+    <a href="/data" class="btn">View Live Data</a>
+    <a href="/products" class="btn">Browse EMWIN</a>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Meshcore Weather Portal{% endblock %}</title>
+  <link rel="stylesheet" href="/static/portal.css">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <header class="header">
+    <div class="header-inner">
+      <a href="/" class="brand">
+        Meshcore Weather
+        <span class="brand-badge">GOES-E</span>
+      </a>
+      <nav class="nav">
+        <a href="/" class="{% if page == 'index' %}active{% endif %}">Dashboard</a>
+        <a href="/config" class="{% if page == 'config' %}active{% endif %}">Region</a>
+        <a href="/data" class="{% if page == 'data' %}active{% endif %}">Live Data</a>
+        <a href="/products" class="{% if page == 'products' %}active{% endif %}">EMWIN</a>
+        <a href="/status" class="{% if page == 'status' %}active{% endif %}">Status</a>
+      </nav>
+    </div>
+  </header>
+  <main class="main">
+    {% block content %}{% endblock %}
+  </main>
+  <script src="/static/vendor/htmx.min.js" defer></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

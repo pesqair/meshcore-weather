@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Status — Meshcore Weather Portal{% endblock %}
+{% block content %}
+<h1 class="page-title">Bot Status</h1>
+<p class="page-subtitle">Radio connection, product store, broadcaster, and contacts.</p>
+
+<div class="card">
+  <div class="card-header">
+    <div>
+      <div class="card-title">Operational</div>
+      <div class="card-subtitle" id="status-updated">Loading…</div>
+    </div>
+    <button class="btn" onclick="loadStatus()">Refresh</button>
+  </div>
+  <div id="status-grid" class="grid grid-2"></div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <div>
+      <div class="card-title">Actions</div>
+    </div>
+  </div>
+  <div class="flex gap-2">
+    <button class="btn btn-primary" onclick="doAction('/api/actions/broadcast', this)">Broadcast Now</button>
+  </div>
+  <div id="action-result" class="text-small mt-4"></div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadStatus() {
+  try {
+    const resp = await fetch('/api/status');
+    const data = await resp.json();
+    const grid = document.getElementById('status-grid');
+    grid.innerHTML = `
+      <div class="stat">
+        <div class="stat-label">Text Channel</div>
+        <div class="stat-value"><span class="dot dot-green"></span>#${data.radio.channel_idx ?? '?'}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Data Channel</div>
+        <div class="stat-value">
+          ${data.radio.data_channel_idx !== null
+            ? `<span class="dot dot-green"></span>#${data.radio.data_channel_idx}`
+            : `<span class="dot dot-gray"></span>Off`}
+        </div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">EMWIN Products</div>
+        <div class="stat-value">${data.store.product_count}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">Known Contacts</div>
+        <div class="stat-value">${data.contacts.known}</div>
+      </div>
+      <div class="stat" style="grid-column: 1 / -1;">
+        <div class="stat-label">Coverage</div>
+        <div class="stat-value" style="font-size: 17px;">${escapeHtml(data.broadcaster.coverage || '(broadcaster not running)')}</div>
+      </div>
+    `;
+    document.getElementById('status-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById('status-updated').textContent = 'Load failed: ' + e.message;
+  }
+}
+
+async function doAction(url, btn) {
+  const resultEl = document.getElementById('action-result');
+  btn.disabled = true;
+  resultEl.textContent = 'Running…';
+  try {
+    const resp = await fetch(url, {method: 'POST'});
+    if (resp.ok) {
+      resultEl.innerHTML = '<span style="color: var(--color-success);">✓ Done</span>';
+    } else {
+      const data = await resp.json().catch(() => ({}));
+      resultEl.innerHTML = `<span style="color: var(--color-danger);">✗ ${escapeHtml(data.detail || resp.statusText)}</span>`;
+    }
+  } catch (e) {
+    resultEl.innerHTML = `<span style="color: var(--color-danger);">✗ ${escapeHtml(e.message)}</span>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+loadStatus();
+setInterval(loadStatus, 30000);
+</script>
+{% endblock %}

@@ -5,7 +5,9 @@ WORKDIR /app
 COPY pyproject.toml .
 COPY meshcore_weather/ meshcore_weather/
 
-RUN pip install --no-cache-dir ".[radar]"
+RUN pip install --no-cache-dir ".[radar,portal]"
+
+EXPOSE 8080
 
 # Non-root user with dialout group for serial access
 RUN useradd -m -s /bin/bash mcw && \

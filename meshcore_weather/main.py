@@ -60,6 +60,7 @@ class WeatherBot:
         self._running = False
         self._refresh_task: asyncio.Task | None = None
         self._broadcaster = None  # MeshWXBroadcaster, created if data channel configured
+        self._portal = None  # PortalServer, created if portal enabled
         self._paging: dict[str, dict] = {}  # sender_key -> {full, offset, ts}
         self._rate_limit: dict[str, float] = {}
         # Map sender names to pubkey prefixes — persisted to disk
@@ -98,6 +99,15 @@ class WeatherBot:
             self._broadcaster = MeshWXBroadcaster(self.store, self.radio)
             await self._broadcaster.start()
 
+        # Start local operator web portal if enabled
+        if settings.portal_enabled:
+            try:
+                from meshcore_weather.portal.server import PortalServer
+                self._portal = PortalServer(self)
+                await self._portal.start()
+            except ImportError as e:
+                logger.warning("Portal disabled: %s (run `pip install meshcore-weather[portal]`)", e)
+
         logger.info(
             "Weather bot is running. Listening on channel %d (%s) + DMs",
             self.radio.channel_idx,
@@ -107,6 +117,8 @@ class WeatherBot:
     async def stop(self) -> None:
         logger.info("Shutting down Weather Bot")
         self._running = False
+        if self._portal:
+            await self._portal.stop()
         if self._broadcaster:
             await self._broadcaster.stop()
         if self._refresh_task:

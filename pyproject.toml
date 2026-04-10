@@ -25,6 +25,11 @@ dev = [
 radar = [
     "Pillow>=10.0",
 ]
+portal = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "jinja2>=3.1",
+]
 sdr = [
     "numpy>=1.26",
 ]
@@ -37,7 +42,15 @@ meshcore-weather-cli = "meshcore_weather.cli:main"
 where = ["."]
 
 [tool.setuptools.package-data]
-meshcore_weather = ["geodata/*.json"]
+meshcore_weather = [
+    "geodata/*.json",
+    "portal/templates/*.html",
+    "portal/templates/partials/*.html",
+    "portal/static/*.css",
+    "portal/static/*.js",
+    "portal/static/vendor/**/*",
+    "portal/static/geo/*.geojson",
+]
 
 [tool.ruff]
 target-version = "py311"

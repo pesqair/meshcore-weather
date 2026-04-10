@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     home_states: str = ""  # e.g. "TX,OK"
     home_wfos: str = ""    # e.g. "EWX,FWD,HGX"
 
+    # Local web portal
+    portal_enabled: bool = False
+    portal_host: str = "0.0.0.0"
+    portal_port: int = 8080
+
     # Admin: pubkey prefix of admin user (can run admin DM commands)
     admin_key: str = ""
 

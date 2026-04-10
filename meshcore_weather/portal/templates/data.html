@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Live Data — Meshcore Weather Portal{% endblock %}
+{% block content %}
+<h1 class="page-title">Live Data</h1>
+<p class="page-subtitle">Active warnings. Map view coming in a follow-up (pending bundled PMTiles).</p>
+
+<div class="card">
+  <div class="card-header">
+    <div>
+      <div class="card-title">Active Warnings</div>
+      <div class="card-subtitle" id="warning-summary">Loading…</div>
+    </div>
+    <button class="btn" onclick="loadWarnings()">Refresh</button>
+  </div>
+  <div id="warning-list"></div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+function badgeForSeverity(sev) {
+  if (sev === 3) return '<span class="badge badge-danger">Warning</span>';
+  if (sev === 2) return '<span class="badge badge-warning">Watch</span>';
+  if (sev === 1) return '<span class="badge badge-muted">Advisory</span>';
+  if (sev === 4) return '<span class="badge badge-danger">Emergency</span>';
+  return '';
+}
+
+const WARN_TYPES = {
+  1: 'Tornado', 2: 'Severe T-Storm', 3: 'Flash Flood', 4: 'Flood',
+  5: 'Winter Storm', 6: 'High Wind', 7: 'Fire', 8: 'Marine',
+  9: 'Special', 0xF: 'Other',
+};
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadWarnings() {
+  const listEl = document.getElementById('warning-list');
+  const sumEl = document.getElementById('warning-summary');
+  listEl.innerHTML = '<div class="empty-state">Loading warnings…</div>';
+  try {
+    const resp = await fetch('/api/warnings');
+    const data = await resp.json();
+    const inCoverage = data.warnings.filter(w => w.in_coverage).length;
+    sumEl.textContent = `${data.count} active · ${inCoverage} in coverage`;
+
+    if (!data.warnings.length) {
+      listEl.innerHTML = '<div class="empty-state">No active warnings.</div>';
+      return;
+    }
+
+    const rows = data.warnings.map(w => {
+      const typeName = WARN_TYPES[w.warning_type] || 'Unknown';
+      const coverageBadge = w.in_coverage
+        ? '<span class="badge badge-success">Broadcasting</span>'
+        : '<span class="badge badge-muted">Outside coverage</span>';
+      const zones = (w.zones || []).slice(0, 5).join(', ') + ((w.zones || []).length > 5 ? '…' : '');
+      return `
+        <div class="card" style="padding: var(--space-4); margin-bottom: var(--space-3);">
+          <div class="flex-between mb-4">
+            <div>
+              <strong>${escapeHtml(typeName)}</strong>
+              ${badgeForSeverity(w.severity)}
+              ${coverageBadge}
+            </div>
+            <div class="text-small text-muted">${w.expiry_minutes} min</div>
+          </div>
+          <div class="text-small">${escapeHtml(w.headline || '(no headline)')}</div>
+          <div class="text-small text-muted mt-4 text-mono">${escapeHtml(zones)}</div>
+        </div>
+      `;
+    }).join('');
+    listEl.innerHTML = rows;
+  } catch (e) {
+    listEl.innerHTML = `<div class="empty-state">Failed to load: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+loadWarnings();
+setInterval(loadWarnings, 60000);  // refresh every minute
+</script>
+{% endblock %}

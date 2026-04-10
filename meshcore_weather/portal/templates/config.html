@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+{% block title %}Region — Meshcore Weather Portal{% endblock %}
+{% block content %}
+<h1 class="page-title">Region Configuration</h1>
+<p class="page-subtitle">Tell the bot which area to cover. Only warnings and radar affecting these locations will be broadcast.</p>
+
+<div class="grid grid-2">
+  <!-- Cities -->
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <div class="card-title">Cities</div>
+        <div class="card-subtitle">Include zones near specific cities</div>
+      </div>
+    </div>
+    <div class="input-row mb-4">
+      <input type="text" class="input" id="city-input" placeholder="Austin TX">
+      <button class="btn" onclick="addCity()">Add</button>
+    </div>
+    <div id="city-list" class="tag-list"></div>
+  </div>
+
+  <!-- States -->
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <div class="card-title">States</div>
+        <div class="card-subtitle">Include all zones in these states</div>
+      </div>
+    </div>
+    <div class="input-row mb-4">
+      <input type="text" class="input" id="state-input" placeholder="TX" maxlength="2">
+      <button class="btn" onclick="addState()">Add</button>
+    </div>
+    <div id="state-list" class="tag-list"></div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <div>
+      <div class="card-title">NWS Forecast Offices</div>
+      <div class="card-subtitle">Include all zones served by these offices (e.g. EWX for Austin/San Antonio)</div>
+    </div>
+  </div>
+  <div class="input-row mb-4" style="max-width: 400px;">
+    <input type="text" class="input" id="wfo-input" placeholder="EWX" maxlength="3">
+    <button class="btn" onclick="addWfo()">Add</button>
+  </div>
+  <div id="wfo-list" class="tag-list"></div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <div>
+      <div class="card-title">Coverage Preview</div>
+      <div class="card-subtitle" id="preview-summary">Loading…</div>
+    </div>
+    <div class="flex gap-2">
+      <button class="btn" onclick="refreshPreview()">Preview</button>
+      <button class="btn btn-primary" onclick="saveCoverage()">Save &amp; Reload</button>
+    </div>
+  </div>
+  <div id="save-result" class="text-small text-muted"></div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+// State held in memory; synced to server on save.
+let state = {
+  cities: {{ coverage.sources.cities|default([])|tojson }},
+  states: {{ coverage.sources.states|default([])|tojson }},
+  wfos: {{ coverage.sources.wfos|default([])|tojson }},
+};
+
+function render() {
+  renderList('city-list', state.cities, 'cities');
+  renderList('state-list', state.states, 'states');
+  renderList('wfo-list', state.wfos, 'wfos');
+}
+
+function renderList(elId, items, field) {
+  const el = document.getElementById(elId);
+  if (!items.length) {
+    el.innerHTML = '<span class="text-muted text-small" style="padding: 4px 8px;">None added</span>';
+    return;
+  }
+  el.innerHTML = items.map((item, idx) => `
+    <span class="tag">
+      ${escapeHtml(item)}
+      <button onclick="removeItem('${field}', ${idx})" title="Remove">&times;</button>
+    </span>
+  `).join('');
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function removeItem(field, idx) {
+  state[field].splice(idx, 1);
+  render();
+  refreshPreview();
+}
+
+function addCity() {
+  const input = document.getElementById('city-input');
+  const val = input.value.trim();
+  if (val && !state.cities.includes(val)) {
+    state.cities.push(val);
+    input.value = '';
+    render();
+    refreshPreview();
+  }
+}
+
+function addState() {
+  const input = document.getElementById('state-input');
+  const val = input.value.trim().toUpperCase();
+  if (val.length === 2 && /^[A-Z]{2}$/.test(val) && !state.states.includes(val)) {
+    state.states.push(val);
+    input.value = '';
+    render();
+    refreshPreview();
+  }
+}
+
+function addWfo() {
+  const input = document.getElementById('wfo-input');
+  const val = input.value.trim().toUpperCase();
+  if (val.length === 3 && /^[A-Z]{3}$/.test(val) && !state.wfos.includes(val)) {
+    state.wfos.push(val);
+    input.value = '';
+    render();
+    refreshPreview();
+  }
+}
+
+// Enter key adds
+['city-input', 'state-input', 'wfo-input'].forEach(id => {
+  document.getElementById(id).addEventListener('keydown', e => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      if (id === 'city-input') addCity();
+      else if (id === 'state-input') addState();
+      else if (id === 'wfo-input') addWfo();
+    }
+  });
+});
+
+async function refreshPreview() {
+  const params = new URLSearchParams({
+    cities: state.cities.join(','),
+    states: state.states.join(','),
+    wfos: state.wfos.join(','),
+  });
+  try {
+    const resp = await fetch(`/api/coverage/preview?${params}`);
+    const data = await resp.json();
+    document.getElementById('preview-summary').textContent = data.summary;
+  } catch (e) {
+    document.getElementById('preview-summary').textContent = 'Preview failed';
+  }
+}
+
+async function saveCoverage() {
+  const resultEl = document.getElementById('save-result');
+  resultEl.textContent = 'Saving…';
+  try {
+    const resp = await fetch('/api/coverage/save', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(state),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      resultEl.innerHTML = `<span style="color: var(--color-success);">✓ Saved. Coverage: ${escapeHtml(data.summary || 'updated')}</span>`;
+    } else {
+      resultEl.innerHTML = `<span style="color: var(--color-danger);">✗ ${escapeHtml(data.detail || 'Failed')}</span>`;
+    }
+  } catch (e) {
+    resultEl.innerHTML = `<span style="color: var(--color-danger);">✗ ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+render();
+refreshPreview();
+</script>
+{% endblock %}

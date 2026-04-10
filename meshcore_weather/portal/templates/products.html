@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+{% block title %}EMWIN Products — Meshcore Weather Portal{% endblock %}
+{% block content %}
+<h1 class="page-title">EMWIN Product Browser</h1>
+<p class="page-subtitle">Raw NWS products received from the satellite/internet feed. Bot-side only — not transmitted over the mesh.</p>
+
+<div class="card">
+  <div class="grid grid-4 mb-4">
+    <div>
+      <label class="form-label">Type</label>
+      <select class="input" id="filter-type" onchange="loadProducts()">
+        <option value="">All types</option>
+        {% for t in types %}<option value="{{ t }}">{{ t }}</option>{% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="form-label">Office</label>
+      <select class="input" id="filter-office" onchange="loadProducts()">
+        <option value="">All offices</option>
+        {% for o in offices %}<option value="{{ o }}">{{ o }}</option>{% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="form-label">State</label>
+      <select class="input" id="filter-state" onchange="loadProducts()">
+        <option value="">All states</option>
+        {% for s in states %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+      </select>
+    </div>
+    <div>
+      <label class="form-label">Search</label>
+      <input type="search" class="input" id="filter-q" placeholder="Text contains…" oninput="debouncedLoad()">
+    </div>
+  </div>
+
+  <table class="table">
+    <thead>
+      <tr>
+        <th>Type</th>
+        <th>Office</th>
+        <th>State</th>
+        <th>Time</th>
+        <th>Preview</th>
+      </tr>
+    </thead>
+    <tbody id="products-tbody"></tbody>
+  </table>
+  <div id="products-summary" class="text-small text-muted mt-4"></div>
+</div>
+
+<!-- Modal for full product -->
+<div id="modal" style="display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 200; align-items: center; justify-content: center; padding: var(--space-5);" onclick="if (event.target === this) closeModal()">
+  <div class="card" style="max-width: 900px; max-height: 85vh; overflow: auto; margin: 0; width: 100%;">
+    <div class="card-header">
+      <div class="card-title" id="modal-title">Product</div>
+      <button class="btn" onclick="closeModal()">Close</button>
+    </div>
+    <pre id="modal-body" class="text-mono" style="white-space: pre-wrap; background: var(--color-bg); padding: var(--space-4); border-radius: var(--radius-sm);"></pre>
+  </div>
+</div>
+
+{% endblock %}
+
+{% block scripts %}
+<script>
+let loadTimer = null;
+function debouncedLoad() {
+  clearTimeout(loadTimer);
+  loadTimer = setTimeout(loadProducts, 300);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function loadProducts() {
+  const params = new URLSearchParams({
+    type: document.getElementById('filter-type').value,
+    office: document.getElementById('filter-office').value,
+    state: document.getElementById('filter-state').value,
+    q: document.getElementById('filter-q').value,
+  });
+  const tbody = document.getElementById('products-tbody');
+  try {
+    const resp = await fetch(`/api/products?${params}`);
+    const data = await resp.json();
+    if (!data.products.length) {
+      tbody.innerHTML = '<tr><td colspan="5"><div class="empty-state">No products match the filters.</div></td></tr>';
+      document.getElementById('products-summary').textContent = '';
+      return;
+    }
+    tbody.innerHTML = data.products.map(p => {
+      const ts = new Date(p.timestamp);
+      const tsStr = ts.toISOString().slice(0, 16).replace('T', ' ');
+      return `
+        <tr onclick="openProduct('${escapeHtml(p.filename)}')">
+          <td class="text-mono"><strong>${escapeHtml(p.product_type)}</strong></td>
+          <td class="text-mono">${escapeHtml(p.office || '')}</td>
+          <td class="text-mono">${escapeHtml(p.state || '')}</td>
+          <td class="text-small text-muted">${tsStr} UTC</td>
+          <td class="text-small">${escapeHtml(p.preview || '')}</td>
+        </tr>
+      `;
+    }).join('');
+    document.getElementById('products-summary').textContent =
+      `Showing ${data.products.length} of possibly more (limit 100). Apply filters to narrow.`;
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="5">Failed: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+async function openProduct(filename) {
+  try {
+    const resp = await fetch(`/api/products/${encodeURIComponent(filename)}`);
+    const data = await resp.json();
+    document.getElementById('modal-title').textContent = data.emwin_id + ' — ' + data.product_type;
+    document.getElementById('modal-body').textContent = data.raw_text;
+    document.getElementById('modal').style.display = 'flex';
+  } catch (e) {
+    alert('Failed: ' + e.message);
+  }
+}
+
+function closeModal() {
+  document.getElementById('modal').style.display = 'none';
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+});
+
+loadProducts();
+</script>
+{% endblock %}

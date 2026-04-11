@@ -14,6 +14,7 @@ from meshcore_weather.meshcore.radio import MeshcoreRadio
 from meshcore_weather.parser.weather import WeatherStore
 from meshcore_weather.protocol.coverage import Coverage
 from meshcore_weather.protocol.encoders import (
+    encode_forecast_from_pfm,
     encode_forecast_from_zfp,
     encode_metar,
     encode_rwr_city,
@@ -310,12 +311,21 @@ class MeshWXBroadcaster:
     def _build_forecast(self, loc: dict, query: str) -> bytes | None:
         """Build a 0x31 forecast message for the given location.
 
-        For LOC_PFM_POINT requests, the response will carry LOC_PFM_POINT
-        in its location field (not LOC_ZONE) so the client can correlate
-        the broadcast with its original request. Under the hood we still
-        use the existing ZFP-based forecast path — data quality will
-        improve to PFM-sourced structured data in Commit 2 without any
-        wire format change.
+        Tries PFM (canonical NWS Point Forecast Matrix, structured numeric
+        data) first via encode_forecast_from_pfm, then falls back to ZFP
+        narrative parsing if no PFM product is available for the zone.
+        Same 0x31 wire format on the output regardless of source — the
+        client sees no difference, just better data quality when PFM is
+        available.
+
+        For LOC_PFM_POINT requests, the response carries LOC_PFM_POINT in
+        its location field (not LOC_ZONE) so the client can correlate the
+        broadcast with its original request.
+
+        Uses _build_origs() + _find_any_orig() to handle the SJU→JSJ
+        (San Juan PR) and GUM→GUA (Guam) AWIPS aliases — the resolver
+        returns the canonical WFO code but EMWIN product filenames use
+        the AWIPS alias.
         """
         resolved = resolver.resolve(query)
         if not resolved:
@@ -333,13 +343,25 @@ class MeshWXBroadcaster:
             resp_loc_type = LOC_PFM_POINT
             resp_loc_id = loc.get("pfm_point_id")
 
-        # Find the ZFP product. Use _build_origs() + _find_any_orig() which
-        # handle the SJU→JSJ (San Juan PR) and GUM→GUA (Guam) AWIPS aliases
-        # — the resolver returns the canonical WFO code ("SJU") but the
-        # EMWIN product filenames use the AWIPS alias ("JSJ"). Constructing
-        # "{wfo}{state}" directly from the resolver output would fail for
-        # every Puerto Rico and Guam forecast request.
         origs = self.store._build_origs(resolved)
+
+        # Primary path: PFM (structured numeric forecast data)
+        pfm = self.store._find_any_orig("PFM", origs)
+        if pfm:
+            hours_ago = int(
+                (now_utc_minutes() - pfm.timestamp.hour * 60 - pfm.timestamp.minute) / 60
+            )
+            msg = encode_forecast_from_pfm(
+                pfm.raw_text, zone, max(0, hours_ago),
+                loc_type=resp_loc_type,
+                loc_id=resp_loc_id,
+            )
+            if msg is not None:
+                logger.debug("forecast: PFM source for %s", zone)
+                return msg
+            logger.debug("forecast: PFM found for %s but no usable data", zone)
+
+        # Fallback: ZFP narrative parsing
         zfp = self.store._find_any_orig("ZFP", origs)
         if zfp:
             zone_text = self.store._parse_zfp_zone(zfp.raw_text, zone)
@@ -347,6 +369,7 @@ class MeshWXBroadcaster:
                 hours_ago = int(
                     (now_utc_minutes() - zfp.timestamp.hour * 60 - zfp.timestamp.minute) / 60
                 )
+                logger.debug("forecast: ZFP fallback for %s", zone)
                 return encode_forecast_from_zfp(
                     zone, zfp.raw_text, max(0, hours_ago),
                     loc_type=resp_loc_type,

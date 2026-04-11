@@ -786,3 +786,63 @@ def encode_warning_zones(
 ) -> bytes:
     """Thin wrapper around pack_warning_zones for symmetry with polygon encoder."""
     return pack_warning_zones(warning_type, severity, expires_unix_min, zones, headline)
+
+
+# -- PFM-sourced forecast (preferred over ZFP narrative parsing) --
+
+def encode_forecast_from_pfm(
+    pfm_text: str,
+    zone_code: str,
+    issued_hours_ago: int,
+    loc_type: int | None = None,
+    loc_id=None,
+) -> bytes | None:
+    """Parse a PFM product, find the forecast point for `zone_code`, and
+    encode its 7-day forecast as a 0x31 message.
+
+    PFM gives us hard numeric values from the canonical NWS Point Forecast
+    Matrix table — high/low temps, wind, sky cover, PoP, etc. — instead of
+    the regex-extracted-from-narrative-English approach used by
+    encode_forecast_from_zfp(). Same wire format on the output side, but the
+    field accuracy is much better and we get more days of data.
+
+    Returns None if:
+      - The PFM can't be parsed
+      - No forecast point in the PFM matches `zone_code`
+      - The matched point has insufficient data (no full days available)
+
+    `loc_type` / `loc_id` let the caller override the location reference
+    encoded into the response (e.g. echo back LOC_PFM_POINT for a city
+    forecast request); defaults to LOC_ZONE + zone_code.
+    """
+    # Local import to avoid a hard cycle between encoders → parser → encoders
+    from meshcore_weather.parser.pfm import (
+        parse_pfm, find_point, downsample_to_daily,
+    )
+
+    try:
+        points = parse_pfm(pfm_text)
+    except Exception as exc:
+        logger.debug("PFM parse failed: %s", exc)
+        return None
+
+    point = find_point(points, zone=zone_code)
+    if point is None:
+        logger.debug("PFM has no forecast point for %s (has %d points)",
+                     zone_code, len(points))
+        return None
+
+    daily_periods = downsample_to_daily(point, max_days=7)
+    if not daily_periods:
+        logger.debug("PFM downsampler returned no periods for %s", zone_code)
+        return None
+
+    if loc_type is None:
+        loc_type = LOC_ZONE
+        loc_id = zone_code
+
+    return pack_forecast(
+        loc_type, loc_id,
+        issued_hours_ago=issued_hours_ago,
+        periods=[p.to_encoder_dict() for p in daily_periods],
+    )

@@ -333,21 +333,25 @@ class MeshWXBroadcaster:
             resp_loc_type = LOC_PFM_POINT
             resp_loc_id = loc.get("pfm_point_id")
 
-        # Find the ZFP for this zone via its WFO
-        for wfo in resolved.get("wfos", []):
-            state = zone[:2]
-            zfp = self.store._find("ZFP", f"{wfo}{state}")
-            if zfp:
-                zone_text = self.store._parse_zfp_zone(zfp.raw_text, zone)
-                if zone_text:
-                    hours_ago = int(
-                        (now_utc_minutes() - zfp.timestamp.hour * 60 - zfp.timestamp.minute) / 60
-                    )
-                    return encode_forecast_from_zfp(
-                        zone, zfp.raw_text, max(0, hours_ago),
-                        loc_type=resp_loc_type,
-                        loc_id=resp_loc_id,
-                    )
+        # Find the ZFP product. Use _build_origs() + _find_any_orig() which
+        # handle the SJU→JSJ (San Juan PR) and GUM→GUA (Guam) AWIPS aliases
+        # — the resolver returns the canonical WFO code ("SJU") but the
+        # EMWIN product filenames use the AWIPS alias ("JSJ"). Constructing
+        # "{wfo}{state}" directly from the resolver output would fail for
+        # every Puerto Rico and Guam forecast request.
+        origs = self.store._build_origs(resolved)
+        zfp = self.store._find_any_orig("ZFP", origs)
+        if zfp:
+            zone_text = self.store._parse_zfp_zone(zfp.raw_text, zone)
+            if zone_text:
+                hours_ago = int(
+                    (now_utc_minutes() - zfp.timestamp.hour * 60 - zfp.timestamp.minute) / 60
+                )
+                return encode_forecast_from_zfp(
+                    zone, zfp.raw_text, max(0, hours_ago),
+                    loc_type=resp_loc_type,
+                    loc_id=resp_loc_id,
+                )
         return None
 
     def _build_metar(self, loc: dict, query: str) -> bytes | None:

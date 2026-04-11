@@ -16,7 +16,11 @@ venv/
 data/*.txt
 data/*.bin
 data/*.json
+data/emwin_cache/
 !data/.gitkeep
+
+# Dev-box cache for bundle builder shapefile downloads
+.cache/
 
 # IDE
 .vscode/

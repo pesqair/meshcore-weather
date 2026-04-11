@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "messages": {
     "refresh_request": 1,
     "data_request": 2,
@@ -21,7 +21,8 @@
     "station": 2,
     "place": 3,
     "latlon": 4,
-    "wfo": 5
+    "wfo": 5,
+    "pfm_point": 6
   },
   "warning_types": {
     "tornado": 1,

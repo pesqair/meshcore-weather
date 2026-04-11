@@ -437,17 +437,19 @@ LOC_STATION = 0x02   # 4 bytes: ICAO ASCII
 LOC_PLACE = 0x03     # 3 bytes: uint24 place_id
 LOC_LATLON = 0x04    # 6 bytes: 2x int24 * 10000
 LOC_WFO = 0x05       # 3 bytes: WFO ASCII
+LOC_PFM_POINT = 0x06 # 3 bytes: uint24 index into client's pfm_points.json
 
 
 def pack_location(loc_type: int, loc_id) -> bytes:
     """Pack a location reference as type tag + payload.
 
     loc_type values and expected loc_id formats:
-      LOC_ZONE:    str "TXZ192" → 3 bytes (state_idx byte + uint16 zone_num BE)
-      LOC_STATION: str "KAUS" → 4 bytes ASCII
-      LOC_PLACE:   int place index → 3 bytes uint24 BE
-      LOC_LATLON:  (lat, lon) tuple → 6 bytes (2x int24 * 10000 BE)
-      LOC_WFO:     str "EWX" → 3 bytes ASCII
+      LOC_ZONE:      str "TXZ192" → 3 bytes (state_idx byte + uint16 zone_num BE)
+      LOC_STATION:   str "KAUS" → 4 bytes ASCII
+      LOC_PLACE:     int place index → 3 bytes uint24 BE
+      LOC_LATLON:    (lat, lon) tuple → 6 bytes (2x int24 * 10000 BE)
+      LOC_WFO:       str "EWX" → 3 bytes ASCII
+      LOC_PFM_POINT: int pfm_point index → 3 bytes uint24 BE
     """
     if loc_type == LOC_ZONE:
         if not isinstance(loc_id, str) or len(loc_id) != 6 or loc_id[2] != "Z":
@@ -477,6 +479,11 @@ def pack_location(loc_type: int, loc_id) -> bytes:
         if not isinstance(loc_id, str) or len(loc_id) != 3:
             raise ValueError(f"WFO must be 3 chars, got: {loc_id!r}")
         return bytes([LOC_WFO]) + loc_id.upper().encode("ascii")
+
+    if loc_type == LOC_PFM_POINT:
+        if not isinstance(loc_id, int) or loc_id < 0 or loc_id >= (1 << 24):
+            raise ValueError(f"PFM point ID must be uint24, got: {loc_id}")
+        return bytes([LOC_PFM_POINT]) + loc_id.to_bytes(3, "big")
 
     raise ValueError(f"Unknown loc_type: {loc_type}")
 
@@ -526,6 +533,12 @@ def unpack_location(data: bytes, offset: int = 0) -> tuple[dict, int]:
             raise ValueError("WFO location truncated")
         wfo = data[offset + 1 : offset + 4].decode("ascii", errors="replace")
         return {"type": LOC_WFO, "wfo": wfo}, offset + 4
+
+    if loc_type == LOC_PFM_POINT:
+        if offset + 4 > len(data):
+            raise ValueError("PFM point location truncated")
+        pfm_point_id = int.from_bytes(data[offset + 1 : offset + 4], "big")
+        return {"type": LOC_PFM_POINT, "pfm_point_id": pfm_point_id}, offset + 4
 
     raise ValueError(f"Unknown location type: 0x{loc_type:02x}")
 

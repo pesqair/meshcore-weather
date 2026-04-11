@@ -324,12 +324,21 @@ def encode_forecast_from_zfp(
     zone_code: str,
     zfp_text: str,
     issued_hours_ago: int,
+    loc_type: int | None = None,
+    loc_id=None,
 ) -> bytes | None:
     """Parse a ZFP zone forecast and encode it as a 0x31 forecast message.
 
     ZFP format has periods like:
         .TONIGHT...Mostly clear. Lows around 60. Southeast winds around 5 mph.
         .THURSDAY...Sunny. Highs in the upper 80s. ...
+
+    `zone_code` is always used to LOOK UP the forecast text from the ZFP.
+    `loc_type`/`loc_id` let the caller control what location reference
+    appears in the ENCODED response — defaults to (LOC_ZONE, zone_code) so
+    existing zone-based requests are unchanged, but a LOC_PFM_POINT request
+    can ask the encoder to echo back the PFM point index instead so the
+    client can correlate the broadcast with its original request.
     """
     if not zfp_text:
         return None
@@ -407,8 +416,13 @@ def encode_forecast_from_zfp(
             "condition_flags": flags,
         })
 
+    # Default location reference is the zone itself; caller can override
+    # (e.g. LOC_PFM_POINT with the pfm index so the client can correlate).
+    if loc_type is None:
+        loc_type = LOC_ZONE
+        loc_id = zone_code
     return pack_forecast(
-        LOC_ZONE, zone_code,
+        loc_type, loc_id,
         issued_hours_ago=issued_hours_ago,
         periods=encoded_periods,
     )

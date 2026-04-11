@@ -1,8 +1,10 @@
 """MeshWX broadcast loop: periodically sends binary weather data on the data channel."""
 
 import asyncio
+import json
 import logging
 import time
+from pathlib import Path
 
 import httpx
 
@@ -21,6 +23,7 @@ from meshcore_weather.protocol.meshwx import (
     DATA_FORECAST,
     DATA_METAR,
     DATA_WX,
+    LOC_PFM_POINT,
     LOC_STATION,
     LOC_ZONE,
     cobs_encode,
@@ -46,6 +49,38 @@ class MeshWXBroadcaster:
         self._http_client: httpx.AsyncClient | None = None
         self._latest_radar: tuple[bytes, int] | None = None  # (img_bytes, ts_min)
         self._coverage: Coverage = Coverage.empty()
+        self._pfm_points: list[dict] | None = None  # loaded lazily from client_data/
+        self._pfm_points_path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "client_data"
+            / "pfm_points.json"
+        )
+
+    def _load_pfm_points(self) -> list[dict]:
+        """Load pfm_points.json once and cache. Returns empty list if missing."""
+        if self._pfm_points is not None:
+            return self._pfm_points
+        if not self._pfm_points_path.exists():
+            logger.warning(
+                "pfm_points.json not found at %s — LOC_PFM_POINT requests will fail",
+                self._pfm_points_path,
+            )
+            self._pfm_points = []
+            return self._pfm_points
+        try:
+            data = json.loads(self._pfm_points_path.read_text())
+            # Compact array form: [[name, wfo, lat, lon, zone], ...]
+            points = [
+                {"name": p[0], "wfo": p[1], "lat": p[2], "lon": p[3], "zone": p[4]}
+                for p in data.get("points", [])
+            ]
+            self._pfm_points = points
+            logger.info("Loaded %d PFM points from bundle", len(points))
+            return self._pfm_points
+        except Exception as exc:
+            logger.warning("Failed to load pfm_points.json: %s", exc)
+            self._pfm_points = []
+            return self._pfm_points
 
     def reload_coverage(self) -> None:
         """Rebuild coverage from current settings. Called on startup + config changes."""
@@ -203,24 +238,39 @@ class MeshWXBroadcaster:
         logger.info("Sent v2 response type=0x%02x for %s (%d bytes)",
                     msg[0], rate_key, len(msg))
 
-    @staticmethod
-    def _location_key(loc: dict) -> str:
+    def _location_key(self, loc: dict) -> str:
         """Stable string key for a location (used for rate limiting)."""
         t = loc.get("type")
         if t == LOC_ZONE:
             return f"zone:{loc.get('zone')}"
         if t == LOC_STATION:
             return f"station:{loc.get('station')}"
+        if t == LOC_PFM_POINT:
+            return f"pfm:{loc.get('pfm_point_id')}"
         return str(loc)
 
-    @staticmethod
-    def _location_to_query_string(loc: dict) -> str | None:
-        """Convert a location dict to a string the WeatherStore can resolve."""
+    def _location_to_query_string(self, loc: dict) -> str | None:
+        """Convert a location dict to a string the WeatherStore can resolve.
+
+        For LOC_PFM_POINT, looks up the index in the bundled pfm_points.json
+        and returns the point's canonical zone code so the existing ZFP-based
+        forecast path can use it directly.
+        """
         t = loc.get("type")
         if t == LOC_ZONE:
             return loc.get("zone")
         if t == LOC_STATION:
             return loc.get("station")
+        if t == LOC_PFM_POINT:
+            points = self._load_pfm_points()
+            idx = loc.get("pfm_point_id")
+            if idx is None or idx < 0 or idx >= len(points):
+                logger.debug("PFM point index %s out of range (0..%d)", idx, len(points))
+                return None
+            # Use the canonical zone from the PFM point for ZFP lookup.
+            # Phase 2 will swap this for a direct PFM product lookup, but the
+            # wire format won't change.
+            return points[idx].get("zone")
         return None
 
     def _build_observation(self, loc: dict, query: str) -> bytes | None:
@@ -253,7 +303,15 @@ class MeshWXBroadcaster:
         return None
 
     def _build_forecast(self, loc: dict, query: str) -> bytes | None:
-        """Build a 0x31 forecast message for the given location."""
+        """Build a 0x31 forecast message for the given location.
+
+        For LOC_PFM_POINT requests, the response will carry LOC_PFM_POINT
+        in its location field (not LOC_ZONE) so the client can correlate
+        the broadcast with its original request. Under the hood we still
+        use the existing ZFP-based forecast path — data quality will
+        improve to PFM-sourced structured data in Commit 2 without any
+        wire format change.
+        """
         resolved = resolver.resolve(query)
         if not resolved:
             return None
@@ -262,22 +320,28 @@ class MeshWXBroadcaster:
             return None
         zone = zones[0]
 
+        # If this was a LOC_PFM_POINT request, pass the PFM point ID through
+        # to the encoder so the response echoes the requested location type.
+        resp_loc_type = None
+        resp_loc_id = None
+        if loc.get("type") == LOC_PFM_POINT:
+            resp_loc_type = LOC_PFM_POINT
+            resp_loc_id = loc.get("pfm_point_id")
+
         # Find the ZFP for this zone via its WFO
         for wfo in resolved.get("wfos", []):
             state = zone[:2]
             zfp = self.store._find("ZFP", f"{wfo}{state}")
             if zfp:
-                from meshcore_weather.parser.weather import _age_str  # noqa
                 zone_text = self.store._parse_zfp_zone(zfp.raw_text, zone)
                 if zone_text:
-                    # _parse_zfp_zone returns a single period string; we need
-                    # the full text. Fall back to the raw product text.
-                    import math
                     hours_ago = int(
                         (now_utc_minutes() - zfp.timestamp.hour * 60 - zfp.timestamp.minute) / 60
                     )
                     return encode_forecast_from_zfp(
                         zone, zfp.raw_text, max(0, hours_ago),
+                        loc_type=resp_loc_type,
+                        loc_id=resp_loc_id,
                     )
         return None
 

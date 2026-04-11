@@ -12,13 +12,32 @@ Usage:
 Defaults to `./client_data/`.
 """
 
+import io
 import json
+import re
 import sys
+import zipfile
 from collections import OrderedDict
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 GEODATA = ROOT / "meshcore_weather" / "geodata"
+EMWIN_CACHE = ROOT / "data" / "emwin_cache" / "products.jsonl"
+SHAPEFILE_CACHE = ROOT / ".cache" / "nws_shapefiles"
+
+# NWS public forecast zones shapefile (public domain US federal data).
+# Filename encodes the effective date — NWS releases a new version a few
+# times a year. Find current versions at https://www.weather.gov/gis/publiczones
+# When NWS publishes an update, bump both the URL and the expected MD5.
+NWS_ZONES_SHAPEFILE_URL = (
+    "https://www.weather.gov/source/gis/Shapefiles/WSOM/z_16ap26.zip"
+)
+NWS_ZONES_SHAPEFILE_MD5 = "b883244e367c51f493d93ff4feaad9f0"
+
+# Fallback EMWIN bundle URL if local cache is empty (dev-box builds)
+EMWIN_BUNDLE_URL = (
+    "https://tgftp.nws.noaa.gov/SL.us008001/CU.EMWIN/DF.xt/DC.gsatR/OPS/txthrs01.zip"
+)
 
 
 def build_zones(out_dir: Path) -> None:
@@ -182,7 +201,7 @@ def build_dictionary(out_dir: Path) -> None:
 def build_protocol_codes(out_dir: Path) -> None:
     """Export message type + code constants for client use."""
     out = {
-        "version": 3,
+        "version": 4,
         "messages": {
             "refresh_request": 0x01,
             "data_request": 0x02,
@@ -205,6 +224,7 @@ def build_protocol_codes(out_dir: Path) -> None:
             "place": 0x03,
             "latlon": 0x04,
             "wfo": 0x05,
+            "pfm_point": 0x06,
         },
         "warning_types": {
             "tornado": 0x1,
@@ -258,6 +278,306 @@ def build_protocol_codes(out_dir: Path) -> None:
     print(f"  protocol.json: {size:.1f} KB")
 
 
+def _load_pfm_products() -> list[tuple[str, str]]:
+    """Return a list of (filename, raw_text) tuples for PFM products.
+
+    Prefers the bot's local EMWIN cache at data/emwin_cache/products.jsonl
+    if it exists and has content. Falls back to downloading a fresh 3-hour
+    EMWIN bundle from NOAA (dev-box only; production never runs this).
+    """
+    pfms: list[tuple[str, str]] = []
+
+    # Try local cache first
+    if EMWIN_CACHE.exists():
+        try:
+            with EMWIN_CACHE.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    fname = rec.get("filename", "")
+                    text = rec.get("raw_text", "")
+                    if text and "PFM" in fname.upper():
+                        pfms.append((fname, text))
+            if pfms:
+                print(f"  (loaded {len(pfms)} PFM products from local cache)")
+                return pfms
+        except Exception as exc:
+            print(f"  (local cache read failed: {exc})")
+
+    # Fallback: fetch from NOAA (needs internet)
+    print(f"  (no local cache, fetching {EMWIN_BUNDLE_URL})")
+    try:
+        import httpx
+    except ImportError:
+        print("  (httpx not installed, skipping PFM fetch)")
+        return []
+
+    try:
+        resp = httpx.get(EMWIN_BUNDLE_URL, timeout=60.0)
+        resp.raise_for_status()
+    except Exception as exc:
+        print(f"  (bundle fetch failed: {exc})")
+        return []
+
+    def _extract(data: bytes) -> None:
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                for name in zf.namelist():
+                    if name.lower().endswith(".zip"):
+                        try:
+                            _extract(zf.read(name))
+                        except Exception:
+                            pass
+                    elif name.lower().endswith(".txt") and "PFM" in name.upper():
+                        try:
+                            text = zf.read(name).decode(
+                                "utf-8", errors="replace"
+                            ).strip()
+                            if text:
+                                pfms.append((name, text))
+                        except Exception:
+                            pass
+        except zipfile.BadZipFile:
+            pass
+
+    _extract(resp.content)
+    print(f"  (extracted {len(pfms)} PFM products from bundle)")
+    return pfms
+
+
+# PFM forecast point header patterns
+_PFM_AFOS_RE = re.compile(r"^PFM([A-Z]{3})$")
+_PFM_UGC_RE = re.compile(r"^([A-Z]{2}Z\d{3})(?:[->]\d{3})*-\d{6}-\s*$")
+_PFM_COORD_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)N\s+(\d+(?:\.\d+)?)W\s+Elev")
+
+
+def _scrape_pfm_points(text: str) -> list[dict]:
+    """Scrape forecast-point headers from a single PFM product.
+
+    Returns a list of dicts with keys: name, wfo, lat, lon, zone.
+    Uses a lightweight line-by-line scan. This is scope-limited to what's
+    needed for pfm_points.json (name + coords + zone) — not a full PFM
+    column parser, which is Commit 2 scope.
+    """
+    lines = [line.strip() for line in text.splitlines()]
+
+    # Find the AFOS line to get the WFO
+    wfo = "???"
+    for line in lines[:15]:
+        m = _PFM_AFOS_RE.match(line)
+        if m:
+            wfo = m.group(1)
+            break
+
+    points: list[dict] = []
+    i = 0
+    while i < len(lines):
+        m_ugc = _PFM_UGC_RE.match(lines[i])
+        if not m_ugc:
+            i += 1
+            continue
+        zone = m_ugc.group(1)
+
+        # Next non-empty line = point name
+        j = i + 1
+        while j < len(lines) and not lines[j]:
+            j += 1
+        if j >= len(lines):
+            break
+        name = lines[j]
+
+        # Next non-empty line = coordinates
+        k = j + 1
+        while k < len(lines) and not lines[k]:
+            k += 1
+        if k >= len(lines):
+            break
+        m_coord = _PFM_COORD_RE.match(lines[k])
+        if m_coord:
+            try:
+                lat = float(m_coord.group(1))
+                lon = -float(m_coord.group(2))
+            except ValueError:
+                i = k
+                continue
+            points.append({
+                "name": name,
+                "wfo": wfo,
+                "lat": round(lat, 4),
+                "lon": round(lon, 4),
+                "zone": zone,
+            })
+        i = k + 1
+    return points
+
+
+def _fetch_shapefile(url: str, expected_md5: str | None = None) -> Path:
+    """Download a shapefile ZIP to the .cache/nws_shapefiles/ directory.
+
+    Caches forever — re-uses the local file on subsequent runs. Returns the
+    path to the cached ZIP. Raises if download fails and no cached copy
+    exists.
+    """
+    import hashlib
+
+    SHAPEFILE_CACHE.mkdir(parents=True, exist_ok=True)
+    dest = SHAPEFILE_CACHE / url.rsplit("/", 1)[-1]
+
+    if dest.exists():
+        if expected_md5:
+            actual = hashlib.md5(dest.read_bytes()).hexdigest()
+            if actual != expected_md5:
+                print(f"  (cache MD5 mismatch for {dest.name}, re-downloading)")
+                dest.unlink()
+        if dest.exists():
+            print(f"  (using cached {dest.name})")
+            return dest
+
+    print(f"  (fetching {url})")
+    try:
+        import httpx
+    except ImportError as exc:
+        raise RuntimeError("httpx required to download shapefile") from exc
+
+    with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+        resp = client.get(url)
+        resp.raise_for_status()
+        dest.write_bytes(resp.content)
+
+    if expected_md5:
+        actual = hashlib.md5(dest.read_bytes()).hexdigest()
+        if actual != expected_md5:
+            dest.unlink()
+            raise RuntimeError(
+                f"Downloaded shapefile MD5 mismatch: got {actual}, expected {expected_md5}"
+            )
+    print(f"  (cached to {dest})")
+    return dest
+
+
+def build_zones_geojson(out_dir: Path) -> None:
+    """Generate client_data/zones.geojson from the NWS public zones shapefile.
+
+    Downloads the NWS shapefile on first run (into .cache/, git-ignored),
+    loads with geopandas, joins against our zones.json to filter to known
+    zones, simplifies geometries with shapely (~1 km tolerance), and writes
+    a compact GeoJSON keyed by zone code. Client renders warning polygons
+    from this file directly — no runtime geometry transmission.
+    """
+    try:
+        import geopandas as gpd
+    except ImportError:
+        print("  zones.geojson: SKIPPED (geopandas not installed)")
+        return
+
+    try:
+        shapefile_zip = _fetch_shapefile(
+            NWS_ZONES_SHAPEFILE_URL, NWS_ZONES_SHAPEFILE_MD5
+        )
+    except Exception as exc:
+        print(f"  zones.geojson: SKIPPED (shapefile fetch failed: {exc})")
+        return
+
+    # geopandas can read a zipped shapefile directly via zip:// URI
+    try:
+        gdf = gpd.read_file(f"zip://{shapefile_zip}")
+    except Exception as exc:
+        print(f"  zones.geojson: SKIPPED (shapefile read failed: {exc})")
+        return
+
+    # The shapefile's STATE_ZONE field is "TX192"; our canonical form is "TXZ192"
+    # (matches zones.json keys). Build the canonical code and drop rows that
+    # can't be matched to our metadata.
+    known_zones: set[str] = set(json.loads((GEODATA / "zones.json").read_text()).keys())
+
+    def to_canonical(state_zone: str) -> str | None:
+        if not state_zone or len(state_zone) < 3:
+            return None
+        code = f"{state_zone[:2]}Z{state_zone[2:]}"
+        return code if code in known_zones else None
+
+    gdf["code"] = gdf["STATE_ZONE"].apply(to_canonical)
+    filtered = gdf[gdf["code"].notna()].copy()
+    dropped = len(gdf) - len(filtered)
+
+    # Simplify: 0.01° ≈ ~1 km tolerance. NWS zones are huge; this is
+    # visually indistinguishable at any map zoom a weather app uses, and
+    # cuts the GeoJSON size dramatically.
+    filtered["geometry"] = filtered["geometry"].simplify(
+        tolerance=0.01, preserve_topology=True
+    )
+
+    # Keep only the fields we actually need in the bundle
+    out_gdf = filtered[["code", "geometry"]].rename(columns={"code": "code"})
+
+    # Write as minified GeoJSON
+    path = out_dir / "zones.geojson"
+    # geopandas writes pretty JSON by default; we want minified for bundle size
+    geojson_text = out_gdf.to_json(drop_id=True)
+    # to_json is already single-line/compact — write directly
+    path.write_text(geojson_text)
+
+    size_mb = path.stat().st_size / 1024 / 1024
+    matched = len(filtered)
+    missing_from_shapefile = len(known_zones) - len(
+        set(filtered["code"])
+    )
+    print(
+        f"  zones.geojson: {matched:>6} features, {size_mb:.1f} MB  "
+        f"(dropped {dropped} unknown, missing {missing_from_shapefile} of ours)"
+    )
+
+
+def build_pfm_points(out_dir: Path) -> None:
+    """Generate client_data/pfm_points.json from real PFM products.
+
+    Output format (array form for compact JSON):
+        {"version": 1, "points": [[name, wfo, lat, lon, zone], ...]}
+
+    Array INDEX is the pfm_point_id used in LOC_PFM_POINT wire encoding.
+    Ordering is deterministic (sorted by name) so indices are stable across
+    rebuilds as long as the set of PFMs doesn't change.
+    """
+    pfms = _load_pfm_products()
+    if not pfms:
+        print("  pfm_points:   SKIPPED (no PFM products available)")
+        return
+
+    # Scrape all points from all PFMs
+    all_points: list[dict] = []
+    for _name, text in pfms:
+        all_points.extend(_scrape_pfm_points(text))
+
+    # Deduplicate by (name, wfo) — same point can appear in updates
+    seen: dict[tuple[str, str], dict] = {}
+    for p in all_points:
+        key = (p["name"], p["wfo"])
+        # Keep the first occurrence (PFMs within one bundle are homogeneous)
+        if key not in seen:
+            seen[key] = p
+
+    # Deterministic ordering for stable indices across rebuilds
+    ordered = sorted(seen.values(), key=lambda p: (p["name"], p["wfo"]))
+
+    # Compact array form — see docstring
+    out = {
+        "version": 1,
+        "points": [
+            [p["name"], p["wfo"], p["lat"], p["lon"], p["zone"]]
+            for p in ordered
+        ],
+    }
+    path = out_dir / "pfm_points.json"
+    path.write_text(json.dumps(out, separators=(",", ":"), ensure_ascii=False))
+    size = path.stat().st_size / 1024
+    print(f"  pfm_points:    {len(ordered):>6} points, {size:.0f} KB")
+
+
 def main():
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "client_data"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -270,6 +590,8 @@ def main():
     build_state_index(out_dir)
     build_dictionary(out_dir)
     build_protocol_codes(out_dir)
+    build_pfm_points(out_dir)
+    build_zones_geojson(out_dir)
 
     total = sum(f.stat().st_size for f in out_dir.iterdir() if f.is_file())
     print(f"\nTotal: {total / 1024 / 1024:.2f} MB")

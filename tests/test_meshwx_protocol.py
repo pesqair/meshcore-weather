@@ -280,6 +280,24 @@ class TestLocationEncoding:
         loc, _ = unpack_location(encoded)
         assert loc["wfo"] == "EWX"
 
+    def test_pfm_point_roundtrip(self):
+        from meshcore_weather.protocol.meshwx import LOC_PFM_POINT
+        for idx in [0, 42, 567, 9999, 16777215]:
+            encoded = pack_location(LOC_PFM_POINT, idx)
+            assert len(encoded) == 4
+            loc, off = unpack_location(encoded)
+            assert loc["type"] == LOC_PFM_POINT
+            assert loc["pfm_point_id"] == idx
+            assert off == 4
+
+    def test_pfm_point_overflow(self):
+        from meshcore_weather.protocol.meshwx import LOC_PFM_POINT
+        import pytest
+        with pytest.raises(ValueError):
+            pack_location(LOC_PFM_POINT, 1 << 24)
+        with pytest.raises(ValueError):
+            pack_location(LOC_PFM_POINT, -1)
+
 
 class TestDataRequest:
     def test_wx_request(self):

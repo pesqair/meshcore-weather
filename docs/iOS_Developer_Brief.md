@@ -54,6 +54,24 @@ Special Weather Statements (SPS) don't carry VTEC. The v2 path only emitted warn
 
 The bot no longer broadcasts warnings whose `expires_at` is in the past. Previously, EMWIN bundles retained products for ~3 hours after expiration and the bot would happily rebroadcast them with a fake 2-hour extension. Now they're dropped at extraction time. You should still respect the absolute expiry on the client side, but the firehose is cleaner.
 
+### MVP change 5 — LOC_PFM_POINT and new bundle files (unblocks city search)
+
+Three new pieces that together make the city-search → forecast flow work:
+
+**New location type `LOC_PFM_POINT = 0x06`** — 3 bytes (uint24 index into `pfm_points.json`). Use this as the `location_type` when sending a `0x02 FORECAST` request. The bot echoes `LOC_PFM_POINT` back in the `0x31` response so you can correlate broadcasts with your outstanding requests.
+
+**New bundle file `pfm_points.json`** (101 KB, 1,873 forecast points). Generated from real PFM products in the bot's EMWIN cache. Compact array form — array index IS the `pfm_point_id` you send on the wire:
+
+```json
+{"version": 1, "points": [[name, wfo, lat, lon, zone], ...]}
+```
+
+**New bundle file `zones.geojson`** (8.1 MB, 4,047 features). NWS public-domain zone polygons, simplified to ~1 km tolerance. Lets you finally render `0x21` zone-coded warnings as real shapes on the map instead of just listing them as text.
+
+The full end-to-end flow and data-format details are in the "Preload bundle" section further down. TL;DR: your city search screen can be fully client-side (autocomplete from `places.json`, nearest-PFM lookup locally, then send an 8-byte DM with the PFM point index; wait for a ~35-byte `0x31` broadcast back).
+
+**Forecast data quality note**: the bot is still using ZFP narrative parsing under the hood for the forecast content itself, so data is about the same accuracy as if you'd sent a `LOC_ZONE` request. A follow-up commit will swap the server-side data source to proper PFM column-matrix parsing. **Same `0x31` wire format, no client changes needed** — you'll just start seeing more accurate highs/lows/sky codes in the same bytes.
+
 ### MVP wire format — `0x20 Warning Polygon` (v3)
 
 ```
@@ -443,22 +461,113 @@ A standard weather app UX with mesh-specific behaviors:
 
 ## Preload bundle (`client_data/`)
 
-Your iOS app ships with this directory. It's **1.6 MB total** right now, might grow to ~10 MB once we add zone polygons:
+Your iOS app ships with this directory. Current total: **~9.9 MB**. It's committed to the repo at `client_data/` — grab it from there directly.
 
-| File | Size | Purpose |
-|------|------|---------|
-| `zones.json` | 347 KB | NWS forecast zones: code → name, state, WFO, centroid |
-| `places.json` | 1.1 MB | 32,333 US Census places for city search |
-| `stations.json` | 181 KB | METAR stations: ICAO → name, state, coordinates |
-| `wfos.json` | 9 KB | NWS Weather Forecast Offices |
-| `state_index.json` | <1 KB | State → index for compact encoding |
-| `protocol.json` | 2 KB | All enum values (generated from pyIEM) |
-| `weather_dict.json` | 2 KB | Compression dictionary for text fields |
-| `pfm_points.json` | ~50 KB (new) | PFM forecast points per WFO |
-| `zones.geojson` | ~3-5 MB (new) | Zone polygon geometry for warning rendering |
-| `counties.geojson` | ~3-5 MB (new) | County FIPS polygons for warning rendering |
+| File | Size | Purpose | Status |
+|------|------|---------|--------|
+| `zones.json` | 347 KB | NWS forecast zones: code → name, state, WFO, centroid | ✅ shipping |
+| `places.json` | 1.1 MB | 32,333 US Census places for city search | ✅ shipping |
+| `stations.json` | 181 KB | METAR stations: ICAO → name, state, coordinates | ✅ shipping |
+| `wfos.json` | 9 KB | NWS Weather Forecast Offices | ✅ shipping |
+| `state_index.json` | <1 KB | State → 1-byte index for compact encoding | ✅ shipping |
+| `protocol.json` | 2 KB | Version marker + enum reference (`version: 4`) | ✅ shipping |
+| `weather_dict.json` | 2 KB | Compression dictionary (reserved — not active in wire format yet) | ✅ shipping (unused) |
+| `pfm_points.json` | **101 KB** | **1,873 NWS PFM forecast points for city search → forecast flow** | ✅ **new in this batch** |
+| `zones.geojson` | **8.1 MB** | **4,047 simplified zone polygons for map rendering of 0x21 warnings** | ✅ **new in this batch** |
+| `counties.geojson` | TBD | County FIPS polygons (deferred — bot doesn't emit county codes in 0x21 yet) | ⏳ future |
 
-You can download it from the bot's `/api/client_data.tar.gz` endpoint (I'll build that) or check it into the iOS app's git. Regenerated whenever pyIEM adds new phenomenon codes or we update the bundled static data.
+### `pfm_points.json` format
+
+Compact array form. The **array index is the `pfm_point_id`** you send in `LOC_PFM_POINT`:
+
+```json
+{
+  "version": 1,
+  "points": [
+    ["Aberdeen-Brown SD", "ABR", 45.45, -98.42, "SDZ006"],
+    ...
+    ["Austin Bergstrom-Travis TX", "EWX", 30.19, -97.67, "TXZ192"],
+    ...
+  ]
+}
+```
+
+Each entry is `[name, wfo, lat, lon, zone]`. Ordering is deterministic (alphabetical by name, then WFO) so indices are stable across rebuilds.
+
+### `zones.geojson` format
+
+Standard GeoJSON FeatureCollection, one Feature per NWS public forecast zone, keyed by the canonical code:
+
+```json
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"code": "TXZ192"},
+      "geometry": {"type": "Polygon", "coordinates": [[...]]}
+    }
+  ]
+}
+```
+
+Source: NWS public forecast zones shapefile (public-domain US federal data). Simplified with Douglas-Peucker at ~1 km tolerance — visually indistinguishable at any map zoom a weather app would use, but shrinks the file from 25 MB to 8.1 MB.
+
+**When you decode a `0x21` warning message, look up each received zone code in this file and render the polygon.** You already get `zones.json` for the metadata (name, state, WFO, centroid); `zones.geojson` is what gives you the actual shape for map display.
+
+### City search → forecast flow (end-to-end)
+
+With this bundle, the city search feature you were asking about works like this:
+
+```
+User types "Austin"
+      ↓
+Autocomplete from places.json                      [client-side]
+      ↓
+User picks "Austin, TX" (place_id 1234)            [client-side]
+      ↓
+Client reads lat/lon from places.json[1234]        [client-side]
+      ↓
+Client finds nearest pfm_points.json entry         [client-side]
+  → Austin Bergstrom-Travis TX, index 102
+      ↓
+pack_data_request(
+    data_type = DATA_FORECAST (0x1),
+    loc_type  = LOC_PFM_POINT (0x6),
+    loc_id    = 102,
+)                                                   [client-side]
+      ↓
+8-byte DM sent to the bot
+      ↓
+─────────────────────────────────────────────────────
+      ↓
+Bot: unpack_data_request, loc_type == LOC_PFM_POINT [bot]
+      ↓
+Bot: reads its own pfm_points.json[102]             [bot]
+  → ("Austin Bergstrom-Travis TX", "EWX", "TXZ192")
+      ↓
+Bot: looks up ZFP for EWX/TXZ192                   [bot]
+      ↓
+Bot: encode_forecast_from_zfp with                  [bot]
+  loc_type=LOC_PFM_POINT, loc_id=102
+  (so the response ECHOES your original loc type)
+      ↓
+Bot broadcasts 0x31 on #wx-broadcast (~35 bytes)
+      ↓
+─────────────────────────────────────────────────────
+      ↓
+Your client (and every other listening client)
+  decodes the 0x31
+      ↓
+Checks loc_id against its outstanding requests
+  → matches idx 102 → displays in Austin's detail screen
+      ↓
+Rate limit: 5 min per (data_type, location). If user B asks
+for Austin within 5 min, response comes from bot's broadcast
+of user A's request — zero extra airtime.
+```
+
+**Forecast data quality note**: under the hood the bot is still using ZFP narrative parsing for the forecast content right now (highs/lows/sky/precip extracted with regex from the ZFP text). A follow-up commit will swap the data source for proper PFM column-matrix parsing (3-hourly structured data downsampled to daily periods). **That change is invisible on the wire** — same `0x31` format, same bytes, just better accuracy in the fields. You don't need to do anything on your side when that lands.
 
 ---
 

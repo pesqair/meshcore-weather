@@ -13,6 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY pyproject.toml .
 COPY meshcore_weather/ meshcore_weather/
+# client_data/ holds the preload bundle (zones.geojson, pfm_points.json, etc.)
+# The broadcaster resolves it relative to /app at runtime so it must be in
+# the image, not just on the dev box.
+COPY client_data/ client_data/
 
 RUN pip install --no-cache-dir ".[radar,portal]"
 

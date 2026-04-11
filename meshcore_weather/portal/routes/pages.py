@@ -38,6 +38,21 @@ async def config_page(request: Request):
     )
 
 
+@router.get("/schedule", response_class=HTMLResponse)
+async def schedule_page(request: Request):
+    """Broadcast schedule management page."""
+    templates = request.app.state.templates
+    bot = request.app.state.bot
+    data_channel = (
+        bot.radio.data_channel_idx if bot.radio else None
+    )
+    return templates.TemplateResponse(
+        request,
+        "schedule.html",
+        {"page": "schedule", "data_channel": data_channel},
+    )
+
+
 @router.get("/data", response_class=HTMLResponse)
 async def data_page(request: Request):
     templates = request.app.state.templates

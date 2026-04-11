@@ -1,12 +1,26 @@
-"""MeshWX broadcast loop: periodically sends binary weather data on the data channel."""
+"""MeshWX broadcaster — reactive path (responds to client DMs).
+
+The proactive periodic broadcast cycle lives in
+`meshcore_weather.schedule.Scheduler` as of the unified schedule
+refactor. This class now owns a Scheduler instance for proactive
+broadcasts and handles the reactive paths:
+
+  - `respond_to_data_request()` — builds a 0x30/0x31/0x32/... response
+    to a client's 0x02 data request DM, with per-(data_type, location)
+    rate limiting.
+  - `broadcast_region()` — legacy 0x01 refresh request handler.
+
+Both reactive paths share the radio with the Scheduler and use the same
+builder methods (`_build_observation` etc.) under the hood. The
+Scheduler uses its own executor for proactive broadcasts; the duplicate
+builder code will be consolidated in a future cleanup.
+"""
 
 import asyncio
 import json
 import logging
 import time
 from pathlib import Path
-
-import httpx
 
 from meshcore_weather.config import settings
 from meshcore_weather.geodata import resolver
@@ -42,7 +56,11 @@ from meshcore_weather.protocol.meshwx import (
     cobs_encode,
     pack_warnings_near,
 )
-from meshcore_weather.protocol.radar import fetch_radar_composite, build_radar_messages
+from meshcore_weather.protocol.radar import (
+    build_radar_messages,
+    extract_region_grid,
+    fetch_radar_composite,
+)
 from meshcore_weather.protocol.warnings import extract_active_warnings, warnings_to_binary
 
 logger = logging.getLogger(__name__)
@@ -52,230 +70,57 @@ TX_SPACING = 2
 
 
 class MeshWXBroadcaster:
-    """Broadcasts binary weather data on the MeshWX data channel."""
+    """Reactive broadcast path — responds to client data requests.
+
+    The proactive periodic broadcast cycle lives in the Scheduler
+    (`meshcore_weather.schedule.scheduler.Scheduler`), which this class
+    owns as a member. `start()` launches the scheduler's tick loop.
+    `respond_to_data_request()` handles incoming client DMs by building
+    the right wire message and broadcasting it on the data channel —
+    separate from the scheduled path.
+    """
 
     def __init__(self, store: WeatherStore, radio: MeshcoreRadio):
+        # Local import avoids a circular dependency between this module
+        # and meshcore_weather.schedule.executor (which also imports from
+        # meshcore_weather.protocol).
+        from meshcore_weather.schedule.scheduler import Scheduler
+
         self.store = store
         self.radio = radio
-        self._running = False
-        self._task: asyncio.Task | None = None
         self._last_refresh: dict[int, float] = {}  # region_id -> timestamp
-        self._http_client: httpx.AsyncClient | None = None
-        self._latest_radar: tuple[bytes, int] | None = None  # (img_bytes, ts_min)
-        self._coverage: Coverage = Coverage.empty()
-        self._pfm_points: list[dict] | None = None  # loaded lazily from bundle
-        # client_data/ ships inside the package (see pyproject.toml
-        # package-data), so it travels with the pip install regardless of
-        # deployment location (Docker, bare install, editable mode).
-        # __file__ = .../meshcore_weather/protocol/broadcaster.py
-        # .parent.parent = .../meshcore_weather
-        self._pfm_points_path = (
-            Path(__file__).resolve().parent.parent
-            / "client_data"
-            / "pfm_points.json"
-        )
+        self._scheduler: Scheduler = Scheduler(store=store, radio=radio)
 
-    def _load_pfm_points(self) -> list[dict]:
-        """Load pfm_points.json once and cache. Returns empty list if missing."""
-        if self._pfm_points is not None:
-            return self._pfm_points
-        if not self._pfm_points_path.exists():
-            logger.warning(
-                "pfm_points.json not found at %s — LOC_PFM_POINT requests will fail",
-                self._pfm_points_path,
-            )
-            self._pfm_points = []
-            return self._pfm_points
-        try:
-            data = json.loads(self._pfm_points_path.read_text())
-            # Compact array form: [[name, wfo, lat, lon, zone], ...]
-            points = [
-                {"name": p[0], "wfo": p[1], "lat": p[2], "lon": p[3], "zone": p[4]}
-                for p in data.get("points", [])
-            ]
-            self._pfm_points = points
-            logger.info("Loaded %d PFM points from bundle", len(points))
-            return self._pfm_points
-        except Exception as exc:
-            logger.warning("Failed to load pfm_points.json: %s", exc)
-            self._pfm_points = []
-            return self._pfm_points
-
-    def reload_coverage(self) -> None:
-        """Rebuild coverage from current settings. Called on startup + config changes."""
-        self._coverage = Coverage.from_config()
-        logger.info("Coverage: %s", self._coverage.summary())
+    @property
+    def scheduler(self):
+        """The owned Scheduler instance (for portal access)."""
+        return self._scheduler
 
     @property
     def coverage(self) -> Coverage:
-        return self._coverage
+        """Current coverage — delegates to the Scheduler."""
+        return self._scheduler.coverage
+
+    def reload_coverage(self) -> None:
+        """Rebuild coverage from current settings."""
+        self._scheduler.reload_coverage()
 
     async def start(self) -> None:
-        self._running = True
-        self._http_client = httpx.AsyncClient(timeout=30.0)
-        self.reload_coverage()
-        self._task = asyncio.create_task(self._broadcast_loop())
-        logger.info("MeshWX broadcaster started (interval=%ds)", settings.meshwx_broadcast_interval)
+        """Start the scheduled broadcast cycle."""
+        await self._scheduler.start()
 
     async def stop(self) -> None:
-        self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        if self._http_client:
-            await self._http_client.aclose()
+        """Stop the scheduled broadcast cycle."""
+        await self._scheduler.stop()
 
-    async def _broadcast_loop(self) -> None:
-        # Wait a bit on startup before first broadcast
-        await asyncio.sleep(30)
-        while self._running:
-            try:
-                await self._broadcast_all()
-            except Exception:
-                logger.exception("Error in MeshWX broadcast cycle")
-            await asyncio.sleep(settings.meshwx_broadcast_interval)
-
-    async def _broadcast_all(self) -> None:
-        """Run one full broadcast cycle: radar + warnings + home obs/forecast."""
-        radar_count = await self._broadcast_radar()
-        warn_count = await self._broadcast_warnings()
-        home_count = await self._broadcast_home_locations()
-        if radar_count or warn_count or home_count:
-            logger.info(
-                "MeshWX broadcast: %d radar grid(s), %d warning(s), %d home msg(s)",
-                radar_count, warn_count, home_count,
-            )
-
-    async def _fetch_radar(self) -> None:
-        """Fetch latest radar composite from IEM."""
-        if not self._http_client:
-            return
-        result = await fetch_radar_composite(self._http_client)
-        if result:
-            self._latest_radar = result
-
-    async def _broadcast_radar(self) -> int:
-        """Fetch and broadcast COBS-encoded radar grids (filtered by coverage)."""
-        await self._fetch_radar()
-        if not self._latest_radar:
-            return 0
-        img_data, ts_min = self._latest_radar
-        region_ids = self._coverage.region_ids if not self._coverage.is_empty() else None
-        msgs = build_radar_messages(img_data, ts_min, region_ids=region_ids)
-        sent = 0
-        for msg in msgs:
-            await self.radio.send_binary_channel(cobs_encode(msg))
-            sent += 1
-            await asyncio.sleep(TX_SPACING)
-        return sent
-
-    async def _broadcast_warnings(self) -> int:
-        """Broadcast COBS-encoded warning polygons (filtered by coverage)."""
-        warnings = extract_active_warnings(self.store, coverage=self._coverage)
-        msgs = warnings_to_binary(warnings)
-        sent = 0
-        for msg in msgs:
-            await self.radio.send_binary_channel(cobs_encode(msg))
-            sent += 1
-            if sent < len(msgs):
-                await asyncio.sleep(TX_SPACING)
-        return sent
-
-    async def _broadcast_home_locations(self) -> int:
-        """Broadcast a 0x30 observation and 0x31 forecast for each home city.
-
-        Iterates through `settings.home_cities` (the operator-configured
-        list), resolves each city, builds the obs + forecast messages with
-        the same builders the v2 data-request path uses, and sends them on
-        the data channel.
-
-        For forecasts we prefer LOC_PFM_POINT (the same location type the
-        iOS city-search flow uses) so a client that has saved the city
-        from autocomplete will recognize the broadcast and update its
-        cached forecast without ever sending a request. Falls back to
-        LOC_ZONE if the city has no nearby PFM point.
-
-        For observations we use LOC_ZONE since RWR/METAR data is
-        zone/station-keyed; clients should index their cache by both zone
-        code and pfm_point_id so an obs broadcast can update an entry the
-        client originally saved by city search.
-        """
-        from meshcore_weather.config import settings
-
-        cities_csv = (settings.home_cities or "").strip()
-        if not cities_csv:
-            return 0
-
-        cities = [c.strip() for c in cities_csv.split(",") if c.strip()]
-        if not cities:
-            return 0
-
-        sent = 0
-        for city in cities:
-            resolved = resolver.resolve(city)
-            if not resolved:
-                logger.debug("home broadcast: could not resolve %r", city)
-                continue
-            zones = resolved.get("zones") or []
-            if not zones:
-                logger.debug("home broadcast: %r has no zones", city)
-                continue
-            zone = zones[0]
-
-            # 0x30 Observation — keyed by zone (RWR fallback) or station (METAR)
-            obs_loc = {"type": LOC_ZONE, "zone": zone}
-            obs_msg = self._build_observation(obs_loc, city)
-            if obs_msg:
-                await self.radio.send_binary_channel(cobs_encode(obs_msg))
-                sent += 1
-                logger.debug("home broadcast: sent obs for %s (%d bytes)", city, len(obs_msg))
-                await asyncio.sleep(TX_SPACING)
-
-            # 0x31 Forecast — prefer LOC_PFM_POINT so iOS city-search clients
-            # match the broadcast. Find the nearest PFM point to the city.
-            pfm_idx = self._nearest_pfm_point_index(
-                resolved.get("lat", 0.0), resolved.get("lon", 0.0)
-            )
-            if pfm_idx is not None:
-                fc_loc = {"type": LOC_PFM_POINT, "pfm_point_id": pfm_idx}
-            else:
-                fc_loc = {"type": LOC_ZONE, "zone": zone}
-            fc_msg = self._build_forecast(fc_loc, city)
-            if fc_msg:
-                await self.radio.send_binary_channel(cobs_encode(fc_msg))
-                sent += 1
-                logger.debug("home broadcast: sent fcst for %s (%d bytes)", city, len(fc_msg))
-                await asyncio.sleep(TX_SPACING)
-
-        return sent
-
-    def _nearest_pfm_point_index(self, lat: float, lon: float) -> int | None:
-        """Return the array index of the nearest PFM point to (lat, lon),
-        or None if pfm_points.json isn't available or no point is within
-        a reasonable distance (~50 km).
-        """
-        points = self._load_pfm_points()
-        if not points:
-            return None
-        best_idx: int | None = None
-        best_d2 = float("inf")
-        for i, p in enumerate(points):
-            dlat = lat - p["lat"]
-            dlon = lon - p["lon"]
-            d2 = dlat * dlat + dlon * dlon
-            if d2 < best_d2:
-                best_d2 = d2
-                best_idx = i
-        # Quick distance gate (~50 km = 0.45° squared = 0.2)
-        if best_d2 > 0.2:
-            return None
-        return best_idx
+    # -- Legacy 0x01 refresh request handler --------------------------------
 
     async def broadcast_region(self, region_id: int, request_type: int = 3) -> None:
-        """Broadcast data for a specific region (triggered by refresh request).
+        """Broadcast data for a specific region (triggered by 0x01 refresh request).
+
+        This is the legacy v1 refresh-request path. iOS clients should
+        use 0x02 data requests instead; this handler remains for backward
+        compat with v1 clients.
 
         request_type: 1=radar only, 2=warnings only, 3=both.
         """
@@ -286,12 +131,13 @@ class MeshWXBroadcaster:
             return
         self._last_refresh[region_id] = now
 
+        # Reuse the scheduler's cached radar composite when available;
+        # otherwise refresh it via a one-off fetch.
         if request_type in (1, 3):
-            await self._fetch_radar()
-            if self._latest_radar:
-                from meshcore_weather.protocol.radar import extract_region_grid
+            await self._scheduler._refresh_radar()
+            if self._scheduler._latest_radar is not None:
                 from meshcore_weather.protocol.meshwx import pack_radar_grid, REGIONS
-                img_data, ts_min = self._latest_radar
+                img_data, ts_min = self._scheduler._latest_radar
                 grid = extract_region_grid(img_data, region_id)
                 if grid:
                     region = REGIONS[region_id]
@@ -299,7 +145,15 @@ class MeshWXBroadcaster:
                     await self.radio.send_binary_channel(cobs_encode(msg))
 
         if request_type in (2, 3):
-            await self._broadcast_warnings()
+            # Broadcast all active warnings in the scheduler's coverage
+            warnings = extract_active_warnings(
+                self.store, coverage=self._scheduler.coverage
+            )
+            msgs = warnings_to_binary(warnings)
+            for i, msg in enumerate(msgs):
+                await self.radio.send_binary_channel(cobs_encode(msg))
+                if i + 1 < len(msgs):
+                    await asyncio.sleep(TX_SPACING)
 
         logger.info("MeshWX refresh for region 0x%X (type=%d)", region_id, request_type)
 
@@ -384,14 +238,14 @@ class MeshWXBroadcaster:
         if t == LOC_STATION:
             return loc.get("station")
         if t == LOC_PFM_POINT:
-            points = self._load_pfm_points()
+            # Delegate to the scheduler's pfm_points list (loaded once at
+            # startup). Falls back to an empty list if the scheduler hasn't
+            # started yet, which is fine — the request just returns None.
+            points = self._scheduler._pfm_points
             idx = loc.get("pfm_point_id")
             if idx is None or idx < 0 or idx >= len(points):
                 logger.debug("PFM point index %s out of range (0..%d)", idx, len(points))
                 return None
-            # Use the canonical zone from the PFM point for ZFP lookup.
-            # Phase 2 will swap this for a direct PFM product lookup, but the
-            # wire format won't change.
             return points[idx].get("zone")
         return None
 

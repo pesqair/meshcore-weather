@@ -1,0 +1,292 @@
+{% extends "base.html" %}
+{% block title %}Broadcast Schedule · Meshcore Weather{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Broadcast Schedule</h1>
+  <p class="subtitle">
+    Each job below produces one or more broadcast messages at its configured
+    interval. All broadcasts go out on the data channel
+    (<code>{{ data_channel or "#wx-broadcast" }}</code>). Changes are saved
+    immediately and picked up by the scheduler within 30 seconds.
+  </p>
+</div>
+
+<div class="flex gap-2 mb-4">
+  <button class="btn btn-primary" id="new-job-btn">+ New broadcast job</button>
+  <button class="btn" id="refresh-btn">Refresh</button>
+</div>
+
+<div class="card">
+  <table class="job-table" id="jobs-table">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Product</th>
+        <th>Location</th>
+        <th>Interval</th>
+        <th>Last Run</th>
+        <th>Next Run</th>
+        <th>Bytes (last)</th>
+        <th>Enabled</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="jobs-body">
+      <tr><td colspan="9" class="text-muted">Loading…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<!-- Add / Edit modal -->
+<div class="modal" id="job-modal" style="display:none;">
+  <div class="modal-content">
+    <h2 id="modal-title">New broadcast job</h2>
+    <form id="job-form">
+      <input type="hidden" id="job-mode" value="create">
+      <input type="hidden" id="original-id" value="">
+
+      <label>
+        ID (slug — lowercase letters, digits, - and _)
+        <input type="text" id="job-id" required pattern="[a-z0-9_-]+" maxlength="64">
+      </label>
+
+      <label>
+        Display name
+        <input type="text" id="job-name" required maxlength="120">
+      </label>
+
+      <label>
+        Product
+        <select id="job-product" required></select>
+      </label>
+
+      <label>
+        Location type
+        <select id="job-loctype" required></select>
+      </label>
+
+      <label>
+        Location ID (or leave empty for "coverage")
+        <input type="text" id="job-locid" placeholder="e.g. KAUS / TXZ192 / EWX / 103 / 3">
+      </label>
+
+      <label>
+        Interval (minutes)
+        <input type="number" id="job-interval" required min="1" max="10080" value="60">
+      </label>
+
+      <label class="checkbox">
+        <input type="checkbox" id="job-enabled" checked>
+        Enabled
+      </label>
+
+      <div class="flex gap-2 mt-4">
+        <button type="submit" class="btn btn-primary">Save</button>
+        <button type="button" class="btn" id="cancel-btn">Cancel</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="toast" class="toast" style="display:none;"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const modal = $("#job-modal");
+const toast = $("#toast");
+
+function showToast(msg, ok = true) {
+  toast.textContent = msg;
+  toast.className = "toast " + (ok ? "ok" : "err");
+  toast.style.display = "block";
+  setTimeout(() => { toast.style.display = "none"; }, 3500);
+}
+
+function formatAgo(seconds) {
+  if (seconds == null) return "—";
+  if (seconds < 60) return seconds + "s";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m";
+  if (seconds < 86400) return Math.floor(seconds / 3600) + "h";
+  return Math.floor(seconds / 86400) + "d";
+}
+
+async function loadJobs() {
+  const res = await fetch("/api/schedule/jobs");
+  if (!res.ok) {
+    showToast("Failed to load jobs: " + res.status, false);
+    return;
+  }
+  const data = await res.json();
+  const tbody = $("#jobs-body");
+  if (!data.jobs || data.jobs.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="9" class="text-muted">No broadcast jobs configured.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = data.jobs.map(j => `
+    <tr>
+      <td><strong>${escapeHtml(j.name)}</strong><br><code class="text-muted">${escapeHtml(j.id)}</code></td>
+      <td><code>${escapeHtml(j.product)}</code></td>
+      <td>${escapeHtml(j.location_type)}${j.location_id ? ":" + escapeHtml(j.location_id) : ""}</td>
+      <td>${j.interval_minutes}m</td>
+      <td>${j.last_run_seconds_ago != null ? formatAgo(j.last_run_seconds_ago) + " ago" : "never"}</td>
+      <td>${j.next_run_in_seconds != null ? "in " + formatAgo(j.next_run_in_seconds) : "next tick"}</td>
+      <td>${j.last_bytes} <span class="text-muted">(${j.last_msg_count} msg)</span></td>
+      <td>
+        <button class="btn-mini" onclick="toggleJob('${j.id}')">
+          ${j.enabled ? "✓ on" : "✗ off"}
+        </button>
+      </td>
+      <td class="actions">
+        <button class="btn-mini" onclick="runNow('${j.id}')">Run now</button>
+        <button class="btn-mini" onclick="editJob('${j.id}')">Edit</button>
+        <button class="btn-mini danger" onclick="deleteJob('${j.id}')">Delete</button>
+      </td>
+    </tr>
+  `).join("");
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+async function loadMeta() {
+  const res = await fetch("/api/schedule/meta");
+  const data = await res.json();
+  const products = $("#job-product");
+  const loctypes = $("#job-loctype");
+  products.innerHTML = data.products.map(p => `<option value="${p}">${p}</option>`).join("");
+  loctypes.innerHTML = data.location_types.map(t => `<option value="${t}">${t}</option>`).join("");
+}
+
+function openModal(mode, job) {
+  $("#job-mode").value = mode;
+  if (mode === "edit" && job) {
+    $("#modal-title").textContent = "Edit broadcast job";
+    $("#original-id").value = job.id;
+    $("#job-id").value = job.id;
+    $("#job-id").readOnly = true;
+    $("#job-name").value = job.name;
+    $("#job-product").value = job.product;
+    $("#job-loctype").value = job.location_type;
+    $("#job-locid").value = job.location_id || "";
+    $("#job-interval").value = job.interval_minutes;
+    $("#job-enabled").checked = job.enabled;
+  } else {
+    $("#modal-title").textContent = "New broadcast job";
+    $("#original-id").value = "";
+    $("#job-id").value = "";
+    $("#job-id").readOnly = false;
+    $("#job-name").value = "";
+    $("#job-product").selectedIndex = 0;
+    $("#job-loctype").selectedIndex = 0;
+    $("#job-locid").value = "";
+    $("#job-interval").value = 60;
+    $("#job-enabled").checked = true;
+  }
+  modal.style.display = "flex";
+}
+
+function closeModal() { modal.style.display = "none"; }
+
+async function saveJob(ev) {
+  ev.preventDefault();
+  const mode = $("#job-mode").value;
+  const body = {
+    id: $("#job-id").value.trim(),
+    name: $("#job-name").value.trim(),
+    product: $("#job-product").value,
+    location_type: $("#job-loctype").value,
+    location_id: $("#job-locid").value.trim(),
+    interval_minutes: parseInt($("#job-interval").value, 10),
+    enabled: $("#job-enabled").checked,
+  };
+  const url = mode === "edit"
+    ? `/api/schedule/jobs/${encodeURIComponent($("#original-id").value)}`
+    : `/api/schedule/jobs`;
+  const method = mode === "edit" ? "PUT" : "POST";
+  const res = await fetch(url, {
+    method,
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    showToast("Save failed: " + (err.detail || res.status), false);
+    return;
+  }
+  showToast("Job saved");
+  closeModal();
+  await loadJobs();
+}
+
+async function toggleJob(id) {
+  const res = await fetch(`/api/schedule/jobs/${encodeURIComponent(id)}/toggle`, {method: "POST"});
+  if (!res.ok) { showToast("Toggle failed", false); return; }
+  await loadJobs();
+}
+
+async function runNow(id) {
+  const res = await fetch(`/api/schedule/jobs/${encodeURIComponent(id)}/run-now`, {method: "POST"});
+  if (!res.ok) { showToast("Run failed", false); return; }
+  const data = await res.json();
+  showToast(`Job ran: ${data.messages_sent} message(s) sent`);
+  setTimeout(loadJobs, 500);
+}
+
+async function editJob(id) {
+  const res = await fetch("/api/schedule/jobs");
+  const data = await res.json();
+  const job = data.jobs.find(j => j.id === id);
+  if (!job) { showToast("Job not found", false); return; }
+  openModal("edit", job);
+}
+
+async function deleteJob(id) {
+  if (!confirm(`Delete job ${id}?`)) return;
+  const res = await fetch(`/api/schedule/jobs/${encodeURIComponent(id)}`, {method: "DELETE"});
+  if (!res.ok) { showToast("Delete failed", false); return; }
+  showToast("Job deleted");
+  await loadJobs();
+}
+
+// Wire up
+$("#new-job-btn").addEventListener("click", () => openModal("create"));
+$("#refresh-btn").addEventListener("click", loadJobs);
+$("#cancel-btn").addEventListener("click", closeModal);
+$("#job-form").addEventListener("submit", saveJob);
+modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
+
+// Initial load
+loadMeta().then(loadJobs);
+// Auto-refresh every 30s while the page is open
+setInterval(loadJobs, 30000);
+</script>
+
+<style>
+.job-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.job-table th, .job-table td { padding: 0.5rem 0.6rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+.job-table th { font-weight: 600; background: var(--bg-alt); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.03em; }
+.job-table td code { font-size: 0.82rem; }
+.job-table .actions { white-space: nowrap; }
+.btn-mini { padding: 0.25rem 0.6rem; border: 1px solid var(--border); background: var(--bg); border-radius: 4px; cursor: pointer; font-size: 0.82rem; }
+.btn-mini:hover { background: var(--bg-alt); }
+.btn-mini.danger:hover { background: #fee; border-color: #f99; color: #900; }
+.text-muted { color: var(--text-muted); }
+.modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; z-index: 100; }
+.modal-content { background: var(--bg); padding: 1.5rem 1.75rem; border-radius: 8px; max-width: 500px; width: 90%; box-shadow: 0 10px 40px rgba(0,0,0,0.3); }
+.modal-content h2 { margin-top: 0; }
+.modal-content label { display: block; margin-bottom: 0.8rem; font-size: 0.88rem; }
+.modal-content label.checkbox { display: flex; align-items: center; gap: 0.5rem; }
+.modal-content input[type=text], .modal-content input[type=number], .modal-content select {
+  display: block; width: 100%; padding: 0.45rem 0.6rem; margin-top: 0.25rem;
+  border: 1px solid var(--border); border-radius: 4px; font-size: 0.92rem; background: var(--bg);
+}
+.modal-content input[readonly] { background: var(--bg-alt); color: var(--text-muted); }
+.toast { position: fixed; bottom: 2rem; right: 2rem; padding: 0.75rem 1.25rem; background: #2d4; color: white; border-radius: 6px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); z-index: 200; }
+.toast.err { background: #d33; }
+.subtitle { color: var(--text-muted); font-size: 0.92rem; max-width: 60em; }
+</style>
+{% endblock %}

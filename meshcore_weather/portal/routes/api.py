@@ -6,8 +6,22 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from meshcore_weather.geodata import resolver
 from meshcore_weather.protocol.coverage import Coverage
 from meshcore_weather.protocol.warnings import extract_active_warnings
+from meshcore_weather.schedule.models import (
+    BroadcastJob,
+    LOCATION_TYPES,
+    PRODUCT_TYPES,
+)
 
 router = APIRouter()
+
+
+def _get_scheduler(request: Request):
+    """Return the bot's active Scheduler instance or raise 503."""
+    bot = request.app.state.bot
+    broadcaster = getattr(bot, "_broadcaster", None)
+    if broadcaster is None or not hasattr(broadcaster, "scheduler"):
+        raise HTTPException(503, "scheduler not available")
+    return broadcaster.scheduler
 
 
 # -- Coverage preview & save --
@@ -299,3 +313,109 @@ async def trigger_v2_request(request: Request) -> JSONResponse:
     req = {"data_type": data_type, "location": loc, "client_newest": 0, "flags": 0}
     await broadcaster.respond_to_data_request(req)
     return JSONResponse({"ok": True, "location": loc, "data_type": data_type_str})
+
+
+# -- Broadcast schedule (CRUD) ------------------------------------------------
+
+
+@router.get("/schedule/meta")
+async def schedule_meta() -> JSONResponse:
+    """Return lists of valid product types and location types for form dropdowns."""
+    return JSONResponse({
+        "products": sorted(PRODUCT_TYPES),
+        "location_types": sorted(LOCATION_TYPES),
+    })
+
+
+@router.get("/schedule/jobs")
+async def list_jobs(request: Request) -> JSONResponse:
+    """List all configured broadcast jobs with their runtime status."""
+    scheduler = _get_scheduler(request)
+    cfg = scheduler.current_config()
+    out = []
+    for job in cfg.jobs:
+        status = scheduler.job_status(job.id)
+        out.append({
+            **job.model_dump(),
+            "last_run_unix": status.get("last_run_unix"),
+            "last_run_seconds_ago": status.get("last_run_seconds_ago"),
+            "next_run_in_seconds": status.get("next_run_in_seconds"),
+            "total_runs": status.get("total_runs", 0),
+            "total_bytes": status.get("total_bytes", 0),
+            "last_bytes": status.get("last_bytes", 0),
+            "last_msg_count": status.get("last_msg_count", 0),
+        })
+    return JSONResponse({"jobs": out, "count": len(out)})
+
+
+@router.post("/schedule/jobs")
+async def create_job(request: Request) -> JSONResponse:
+    """Create a new broadcast job from a JSON body."""
+    scheduler = _get_scheduler(request)
+    body = await request.json()
+    try:
+        job = BroadcastJob(**body)
+    except Exception as exc:
+        raise HTTPException(400, f"invalid job: {exc}")
+    cfg = scheduler.current_config()
+    if cfg.get_job(job.id) is not None:
+        raise HTTPException(409, f"job {job.id!r} already exists")
+    cfg.upsert_job(job)
+    await scheduler.save_config(cfg)
+    return JSONResponse({"ok": True, "job": job.model_dump()})
+
+
+@router.put("/schedule/jobs/{job_id}")
+async def update_job(job_id: str, request: Request) -> JSONResponse:
+    """Update an existing broadcast job. Body is the new job dict."""
+    scheduler = _get_scheduler(request)
+    body = await request.json()
+    # The URL param is authoritative for id so the client can't
+    # accidentally rename by changing the body.
+    body["id"] = job_id
+    try:
+        job = BroadcastJob(**body)
+    except Exception as exc:
+        raise HTTPException(400, f"invalid job: {exc}")
+    cfg = scheduler.current_config()
+    if cfg.get_job(job_id) is None:
+        raise HTTPException(404, f"job {job_id!r} not found")
+    cfg.upsert_job(job)
+    await scheduler.save_config(cfg)
+    return JSONResponse({"ok": True, "job": job.model_dump()})
+
+
+@router.delete("/schedule/jobs/{job_id}")
+async def delete_job(job_id: str, request: Request) -> JSONResponse:
+    """Delete a broadcast job by id."""
+    scheduler = _get_scheduler(request)
+    cfg = scheduler.current_config()
+    if not cfg.delete_job(job_id):
+        raise HTTPException(404, f"job {job_id!r} not found")
+    await scheduler.save_config(cfg)
+    return JSONResponse({"ok": True, "deleted": job_id})
+
+
+@router.post("/schedule/jobs/{job_id}/toggle")
+async def toggle_job(job_id: str, request: Request) -> JSONResponse:
+    """Flip the `enabled` flag on a job."""
+    scheduler = _get_scheduler(request)
+    cfg = scheduler.current_config()
+    job = cfg.get_job(job_id)
+    if job is None:
+        raise HTTPException(404, f"job {job_id!r} not found")
+    job.enabled = not job.enabled
+    cfg.upsert_job(job)
+    await scheduler.save_config(cfg)
+    return JSONResponse({"ok": True, "id": job_id, "enabled": job.enabled})
+
+
+@router.post("/schedule/jobs/{job_id}/run-now")
+async def run_job_now(job_id: str, request: Request) -> JSONResponse:
+    """Force-run a specific job immediately, ignoring its interval."""
+    scheduler = _get_scheduler(request)
+    cfg = scheduler.current_config()
+    if cfg.get_job(job_id) is None:
+        raise HTTPException(404, f"job {job_id!r} not found")
+    n_msgs = await scheduler.run_job_now(job_id)
+    return JSONResponse({"ok": True, "id": job_id, "messages_sent": n_msgs})

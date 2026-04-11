@@ -766,9 +766,9 @@ def encode_rain_cities(
 def encode_warning_zones(
     warning_type: int,
     severity: int,
-    expiry_minutes: int,
+    expires_unix_min: int,
     zones: list[str],
     headline: str,
 ) -> bytes:
     """Thin wrapper around pack_warning_zones for symmetry with polygon encoder."""
-    return pack_warning_zones(warning_type, severity, expiry_minutes, zones, headline)
+    return pack_warning_zones(warning_type, severity, expires_unix_min, zones, headline)

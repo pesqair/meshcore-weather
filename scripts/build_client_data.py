@@ -182,7 +182,7 @@ def build_dictionary(out_dir: Path) -> None:
 def build_protocol_codes(out_dir: Path) -> None:
     """Export message type + code constants for client use."""
     out = {
-        "version": 2,
+        "version": 3,
         "messages": {
             "refresh_request": 0x01,
             "data_request": 0x02,

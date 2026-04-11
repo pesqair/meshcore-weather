@@ -60,7 +60,26 @@ class Coverage:
         self.sources: dict = sources or {"cities": [], "states": [], "wfos": []}
         self.bbox: BBox | None = None
         self.region_ids: set[int] = set()
+        # States the operator *explicitly* covers (via home_states or via WFOs
+        # whose served state we can determine). Used to match county-FIPS UGCs
+        # (e.g. TXC029) which are not in the zones set.
+        self.explicit_states: set[str] = set()
+        for s in self.sources.get("states", []) or []:
+            if s:
+                self.explicit_states.add(s.upper())
         self._recompute_bbox_and_regions()
+        self._derive_wfo_states()
+
+    def _derive_wfo_states(self) -> None:
+        """For each explicit WFO, add the states it serves to explicit_states."""
+        wfos = {w.upper() for w in self.sources.get("wfos", []) or []}
+        if not wfos:
+            return
+        for z in resolver._zones.values():
+            if z.get("w", "").upper() in wfos:
+                st = z.get("s", "").upper()
+                if st:
+                    self.explicit_states.add(st)
 
     @classmethod
     def empty(cls) -> "Coverage":
@@ -164,12 +183,26 @@ class Coverage:
         return zone_code in self.zones
 
     def covers_any(self, zone_codes: Iterable[str]) -> bool:
-        """Does any of these zone codes intersect our coverage?"""
+        """Does any of these UGC codes intersect our coverage?
+
+        Accepts both NWS zone codes (TXZ192) and county FIPS (TXC029). Match
+        rules, in order:
+          1. Exact zone match against our zones set (narrow, precise)
+          2. If the operator explicitly covers a state (home_states or a WFO
+             in that state), accept any UGC whose 2-letter prefix matches.
+             This handles warnings whose UGC line uses county FIPS codes,
+             which are NOT in our zones set.
+        """
         if not self.zones:
             return True  # empty coverage = accept everything
-        for code in zone_codes:
+        codes = list(zone_codes)
+        for code in codes:
             if code in self.zones:
                 return True
+        if self.explicit_states:
+            for code in codes:
+                if len(code) >= 2 and code[:2].upper() in self.explicit_states:
+                    return True
         return False
 
     def covers_polygon(self, vertices: list[tuple[float, float]]) -> bool:

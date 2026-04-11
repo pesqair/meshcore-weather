@@ -10,6 +10,113 @@ The win: clients (your iOS app, future web client) can cross-reference everythin
 
 ---
 
+## ⚠️ v3 MVP — what ships RIGHT NOW (this is what you code against today)
+
+Earlier sections of this document describe the **full v3 target state** (68-entry VTEC phenomenon table, action codes, ETN, urgency, certainty, H-VTEC, etc.). We're shipping that incrementally. Start with the **MVP** below — those are wire-format changes that are live in the bot *today* and fix real bugs the user was seeing in your app.
+
+### MVP change 1 — Absolute expiry timestamps (fixes the "363h 10m" bug)
+
+**Problem:** v2 sent a `uint16 expiry_minutes` — "minutes remaining from broadcast time." The client had to track receipt time and count down locally. The bot's relative-time math had a subtle bug (`_vtec_end_to_minutes` parsed the 12-char VTEC end string as 6-char DDHHMM → decoded a next-day expiry as "~363h in the future"). Clients saw ridiculous times because the server was sending garbage.
+
+**Fix (v3 wire format):** the bot now sends a **`uint32 expires_unix_min`** — absolute UTC minutes since the Unix epoch. This is the NWS-authoritative expiry straight from pyIEM's parsed VTEC `endts` (or for SPS products, the UGC-line `ugcexpire`). Client computes "time remaining" from its own clock.
+
+```
+v2 (OLD):   uint16 expiry_minutes     — relative, 2 bytes, buggy
+v3 (NEW):   uint32 expires_unix_min   — absolute Unix minutes, 4 bytes
+```
+
+**Why absolute:**
+- NWS-authoritative — if a warning says "until 01:00Z" that timestamp is the source of truth
+- No re-broadcast jitter — the same warning re-broadcast 20 minutes later still has the same `expires_unix_min`
+- Client can detect expired warnings it received late (before my fix, the bot was broadcasting expired warnings with a fake 2-hour extension)
+- Makes server bugs impossible — there's no more "how many minutes from now" math to get wrong
+
+**Converting to display:**
+```swift
+let expiresAt = Date(timeIntervalSince1970: TimeInterval(expiresUnixMin) * 60)
+let minutesRemaining = max(0, Int(expiresAt.timeIntervalSinceNow / 60))
+if minutesRemaining == 0 { /* expired — drop from display */ }
+```
+
+### MVP change 2 — Word-boundary headline truncation (fixes "northwestern Gonzales C")
+
+**Problem:** v2 truncated headlines at the raw byte limit, cutting words in half. You were seeing things like `"...northwestern Gonzales C"`.
+
+**Fix:** the packer now truncates at the last word boundary inside the available space and appends `"..."` when truncation happened. Full headlines still fit un-truncated when they're short enough.
+
+Nothing for you to change on the client side — just decode the headline as UTF-8 and display it. If the headline ends with `"..."` you can add an affordance to tap through to the full text from a (future) detail endpoint, but that's optional.
+
+### MVP change 3 — SPS products now produce warnings (they were silently dropped)
+
+Special Weather Statements (SPS) don't carry VTEC. The v2 path only emitted warnings that had VTEC, so SPS products were completely missed. The new path uses pyIEM's `seg.ugcexpire` for SPS expiry and emits them with `WARN_SPECIAL` (0x9) type and `SEV_ADVISORY` (0x1) severity. You'll now see strong-thunderstorm SPS headlines like "A STRONG THUNDERSTORM WILL IMPACT PORTIONS OF..." appear as warnings in your app's active list.
+
+### MVP change 4 — Expired warnings are filtered server-side
+
+The bot no longer broadcasts warnings whose `expires_at` is in the past. Previously, EMWIN bundles retained products for ~3 hours after expiration and the bot would happily rebroadcast them with a fake 2-hour extension. Now they're dropped at extraction time. You should still respect the absolute expiry on the client side, but the firehose is cleaner.
+
+### MVP wire format — `0x20 Warning Polygon` (v3)
+
+```
+byte 0     : 0x20  MSG_WARNING
+byte 1     : warning_type (hi nibble) | severity (lo nibble)
+             warning_type: still the old v2 nibble values (WARN_TORNADO=0x1,
+                           WARN_SEVERE_TSTORM=0x2, WARN_FLASH_FLOOD=0x3,
+                           WARN_FLOOD=0x4, WARN_WINTER_STORM=0x5,
+                           WARN_HIGH_WIND=0x6, WARN_FIRE=0x7, WARN_MARINE=0x8,
+                           WARN_SPECIAL=0x9, WARN_OTHER=0xF)
+             severity:     SEV_ADVISORY=0x1, SEV_WATCH=0x2, SEV_WARNING=0x3,
+                           SEV_EMERGENCY=0x4
+bytes 2-5  : uint32 BE  expires_unix_min   ← NEW IN v3 (was uint16 expiry_minutes)
+byte 6     : vertex_count
+bytes 7..  : first vertex (6 bytes: int24 lat + int24 lon, × 10000)
+             then (vertex_count-1) × 4 bytes of int16 delta pairs (× 1000)
+remainder  : headline, UTF-8, word-boundary truncated with "..." suffix
+```
+
+### MVP wire format — `0x21 Warning Zones` (v3)
+
+```
+byte 0     : 0x21  MSG_WARNING_ZONES
+byte 1     : warning_type (hi nibble) | severity (lo nibble)   — same as 0x20
+bytes 2-5  : uint32 BE  expires_unix_min   ← NEW IN v3
+byte 6     : zone_count (max 30)
+bytes 7..  : zone_count × 3 bytes (state_idx + uint16 zone_num)
+             client looks up the state_idx in state_index.json to rebuild
+             the full code "TXZ192" and renders from its preloaded zone polygons
+remainder  : headline, UTF-8, word-boundary truncated with "..." suffix
+```
+
+### MVP wire format — `0x37 Warnings Near Location` (v3)
+
+```
+byte 0     : 0x37  MSG_WARNINGS_NEAR
+bytes 1..N : location reference (type-tagged, typically 4 bytes for a zone)
+byte N+1   : entry count
+entries    : each 8 bytes:
+               1 byte  : warning_type (hi nibble) | severity (lo nibble)
+               4 bytes : uint32 BE  expires_unix_min   ← NEW IN v3
+               3 bytes : zone reference (state_idx + uint16 zone_num)
+```
+
+### What's NOT in the MVP yet (but is in the target state below)
+
+- 68-entry VTEC phenomenon table (we still use the old 4-bit warning_type nibble)
+- Action codes (NEW/CON/EXT/CAN…) as a separate field
+- Event Tracking Number (ETN) as a separate field
+- Issuing office as a separate field
+- CAP urgency + certainty
+- UGC-coded warnings carrying county FIPS codes in the wire format (pyIEM internally extracts both but the 0x21 packer still only encodes Z-zones)
+- H-VTEC for flood products
+- PFM as the forecast source
+
+These will come in follow-up sessions. For now the bot's internal data model carries all of them (pyIEM gives us the data), but the wire format hasn't been widened to carry them yet.
+
+### Text-command (DM) path is unchanged
+
+The bot still accepts plain-text commands via DM (e.g. `weather austin tx`) and replies with plain text. That's separate from the binary `#wx-broadcast` channel and is **not** affected by any v3 change. It will get its own revamp later, but for now everything that was working before still works.
+
+---
+
 ## What changes in the protocol
 
 ### 1. Warning type codes → VTEC phenomena

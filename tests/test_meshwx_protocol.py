@@ -75,13 +75,15 @@ class TestRadarGrid:
 
 class TestWarningPolygon:
     def test_round_trip(self):
+        # v3 wire format: absolute Unix-minute expiry (uint32)
+        expires = 29_500_000  # arbitrary large value
         vertices = [
             (30.50, -97.75),
             (30.60, -97.60),
             (30.40, -97.60),
         ]
         msg = pack_warning_polygon(
-            WARN_TORNADO, SEV_WARNING, 45,
+            WARN_TORNADO, SEV_WARNING, expires,
             vertices, "TORNADO WARNING take shelter"
         )
         assert len(msg) <= 136
@@ -89,26 +91,49 @@ class TestWarningPolygon:
         result = unpack_warning_polygon(msg)
         assert result["warning_type"] == WARN_TORNADO
         assert result["severity"] == SEV_WARNING
-        assert result["expiry_minutes"] == 45
+        assert result["expires_unix_min"] == expires
         assert len(result["vertices"]) == 3
         assert abs(result["vertices"][0][0] - 30.50) < 0.001
         assert abs(result["vertices"][0][1] - (-97.75)) < 0.001
         assert "TORNADO WARNING" in result["headline"]
 
     def test_max_size(self):
-        # 20 vertices + long headline
         vertices = [(30.0 + i * 0.01, -97.0 + i * 0.01) for i in range(20)]
         msg = pack_warning_polygon(
-            WARN_TORNADO, SEV_WARNING, 60,
+            WARN_TORNADO, SEV_WARNING, 29_500_000,
             vertices, "X" * 200
         )
         assert len(msg) <= 136
 
     def test_no_vertices(self):
-        msg = pack_warning_polygon(WARN_TORNADO, SEV_WARNING, 30, [], "TEST")
+        msg = pack_warning_polygon(WARN_TORNADO, SEV_WARNING, 29_500_000, [], "TEST")
         result = unpack_warning_polygon(msg)
         assert result["vertices"] == []
         assert result["headline"] == "TEST"
+
+    def test_word_boundary_truncation(self):
+        # Headline longer than available space should truncate at a word
+        # boundary and end with "..." — never mid-word.
+        vertices = [(30.5, -97.75), (30.6, -97.6), (30.4, -97.6)]
+        long_headline = (
+            "strong thunderstorm will impact portions of south central "
+            "Caldwell, east central Guadalupe and northwestern Gonzales County"
+        )
+        msg = pack_warning_polygon(
+            WARN_TORNADO, SEV_WARNING, 29_500_000, vertices, long_headline
+        )
+        result = unpack_warning_polygon(msg)
+        # Either the full headline fits, or it ends with "..."
+        if result["headline"] != long_headline:
+            assert result["headline"].endswith("..."), (
+                f"truncated headline should end with '...': {result['headline']!r}"
+            )
+            # And the last word before "..." should be complete (present in original)
+            before_dots = result["headline"][:-3].rstrip()
+            last_word = before_dots.split()[-1] if before_dots else ""
+            assert last_word in long_headline, (
+                f"mid-word truncation: {last_word!r} not in original"
+            )
 
 
 class TestRefreshRequest:
@@ -165,7 +190,7 @@ class TestCOBS:
 
     def test_round_trip_warning(self):
         vertices = [(30.5, -97.75), (30.6, -97.6), (30.4, -97.6)]
-        msg = pack_warning_polygon(WARN_TORNADO, SEV_WARNING, 45, vertices, "TEST")
+        msg = pack_warning_polygon(WARN_TORNADO, SEV_WARNING, 29_500_000, vertices, "TEST")
         encoded = cobs_encode(msg)
         assert 0x00 not in encoded
         assert cobs_decode(encoded) == msg
@@ -391,7 +416,7 @@ class TestWarningPolygonWideSpan:
             (29.0, -97.5),
         ]
         msg = pack_warning_polygon(
-            WARN_SEVERE_TSTORM, SEV_WARNING, 60, vertices, "TEST"
+            WARN_SEVERE_TSTORM, SEV_WARNING, 29_500_000, vertices, "TEST"
         )
         decoded = unpack_warning_polygon(msg)
         assert len(decoded["vertices"]) == 5
@@ -409,13 +434,13 @@ class TestZoneCodedWarning:
         )
         zones = ["TXZ192", "TXZ193", "TXZ205"]
         msg = pack_warning_zones(
-            WARN_TORNADO, SEV_WARNING, 30, zones, "TAKE SHELTER NOW"
+            WARN_TORNADO, SEV_WARNING, 29_500_000, zones, "TAKE SHELTER NOW"
         )
         assert msg[0] == MSG_WARNING_ZONES
         decoded = unpack_warning_zones(msg)
         assert decoded["warning_type"] == WARN_TORNADO
         assert decoded["severity"] == SEV_WARNING
-        assert decoded["expiry_minutes"] == 30
+        assert decoded["expires_unix_min"] == 29_500_000
         assert decoded["zones"] == zones
         assert decoded["headline"] == "TAKE SHELTER NOW"
 
@@ -424,13 +449,14 @@ class TestZoneCodedWarning:
         from meshcore_weather.protocol.meshwx import (
             pack_warning_zones, WARN_TORNADO, SEV_WARNING,
         )
-        # 5 zones = 1 + 1 + 2 + 1 + 15 + headline
+        # v3: 7-byte header + zones + headline
         msg = pack_warning_zones(
-            WARN_TORNADO, SEV_WARNING, 60, ["TXZ192", "TXZ193", "TXZ205", "TXZ206", "TXZ207"],
+            WARN_TORNADO, SEV_WARNING, 29_500_000,
+            ["TXZ192", "TXZ193", "TXZ205", "TXZ206", "TXZ207"],
             "TORNADO WARNING until 915 PM CDT"
         )
-        # 5 header bytes + 15 zone bytes + ~33 headline = ~53 bytes
-        assert len(msg) < 60
+        # 7 header bytes + 15 zone bytes + ~33 headline = ~55 bytes
+        assert len(msg) < 64
 
 
 class TestOutlook:
@@ -510,8 +536,10 @@ class TestWarningsNear:
             MSG_WARNINGS_NEAR,
         )
         warnings = [
-            {"warning_type": WARN_TORNADO, "severity": SEV_WARNING, "expiry_minutes": 30, "zone": "TXZ192"},
-            {"warning_type": WARN_FLASH_FLOOD, "severity": SEV_WATCH, "expiry_minutes": 480, "zone": "TXZ205"},
+            {"warning_type": WARN_TORNADO, "severity": SEV_WARNING,
+             "expires_unix_min": 29_500_030, "zone": "TXZ192"},
+            {"warning_type": WARN_FLASH_FLOOD, "severity": SEV_WATCH,
+             "expires_unix_min": 29_500_480, "zone": "TXZ205"},
         ]
         msg = pack_warnings_near(LOC_ZONE, "TXZ192", warnings)
         assert msg[0] == MSG_WARNINGS_NEAR
@@ -519,4 +547,4 @@ class TestWarningsNear:
         assert len(decoded["warnings"]) == 2
         assert decoded["warnings"][0]["warning_type"] == WARN_TORNADO
         assert decoded["warnings"][0]["zone"] == "TXZ192"
-        assert decoded["warnings"][1]["expiry_minutes"] == 480
+        assert decoded["warnings"][1]["expires_unix_min"] == 29_500_480

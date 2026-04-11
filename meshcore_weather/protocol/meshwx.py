@@ -198,71 +198,113 @@ def unpack_radar_grid(data: bytes) -> dict:
     }
 
 
-# -- Warning Polygon (0x20) -- variable, max 136 bytes --
+# -- Headline truncation helper (shared by warning packers) ------------------
+
+
+def _fit_headline(headline: str, max_bytes: int) -> bytes:
+    """Encode a headline to UTF-8 and truncate cleanly at a word boundary.
+
+    Never cuts mid-word. If truncation is needed, ends with a trailing
+    ellipsis (ASCII "...") so the client can tell the string is abbreviated.
+    Returns an empty bytestring for an empty or empty-after-strip headline.
+    """
+    if not headline or max_bytes <= 0:
+        return b""
+    encoded = headline.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return encoded
+    # Leave 3 bytes for the trailing "..."
+    room = max_bytes - 3
+    if room <= 0:
+        # Not enough space for even "..." — just return as many bytes as fit.
+        # Avoid slicing mid-codepoint by decoding with errors='ignore'.
+        return encoded[:max_bytes].decode("utf-8", errors="ignore").encode("utf-8")
+    # Walk backward from `room` to the last space so we don't cut a word.
+    # Decode as utf-8 to operate on characters, not bytes (avoids mid-codepoint).
+    truncated = encoded[:room].decode("utf-8", errors="ignore")
+    # Strip trailing whitespace, then cut at last space if present
+    truncated = truncated.rstrip()
+    last_space = truncated.rfind(" ")
+    if last_space > room // 2:
+        # Only cut at space if it doesn't waste too much room
+        truncated = truncated[:last_space].rstrip()
+    return (truncated + "...").encode("utf-8")
+
+
+# -- Warning Polygon (0x20) v3 -- variable, max 136 bytes --
+#
+# Wire format (v3 — breaking change from v2):
+#   byte 0     : MSG_WARNING (0x20)
+#   byte 1     : warning_type (hi nibble) | severity (lo nibble)
+#   bytes 2-5  : expires_unix_min (uint32 BE, minutes since Unix epoch)
+#                NWS-authoritative absolute expiry. Client computes time
+#                remaining from its own clock. Replaces v2's uint16
+#                "expiry_minutes" relative counter.
+#   byte 6     : vertex_count
+#   bytes 7..  : first vertex (6B int24 lat, int24 lon * 10000)
+#                then (vertex_count-1) * 4 bytes of int16 delta pairs
+#   remainder  : headline, UTF-8, truncated at word boundary with "..."
 
 def pack_warning_polygon(
     warning_type: int,
     severity: int,
-    expiry_minutes: int,
+    expires_unix_min: int,
     vertices: list[tuple[float, float]],
     headline: str,
 ) -> bytes:
-    """Pack a warning polygon into wire format (max 136 bytes).
+    """Pack a warning polygon into wire format v3 (max 136 bytes).
 
-    vertices: list of (lat, lon) in decimal degrees.
+    Args:
+        warning_type: 4-bit type nibble (WARN_TORNADO, WARN_SEVERE_TSTORM, ...).
+        severity: 4-bit severity nibble (SEV_ADVISORY/WATCH/WARNING/EMERGENCY).
+        expires_unix_min: NWS expiry as uint32 Unix minutes (minutes since 1970).
+        vertices: list of (lat, lon) in decimal degrees.
+        headline: short text for the client to display.
     """
     msg = bytearray()
     msg.append(MSG_WARNING)
     msg.append(((warning_type & 0x0F) << 4) | (severity & 0x0F))
-    msg.extend(struct.pack(">H", min(expiry_minutes, 0xFFFF)))
+    msg.extend(struct.pack(">I", expires_unix_min & 0xFFFFFFFF))
     msg.append(len(vertices) & 0xFF)
 
-    if not vertices:
-        remaining = 136 - len(msg)
-        if remaining > 0:
-            msg.extend(headline.encode("utf-8")[:remaining])
-        return bytes(msg)
+    if vertices:
+        # First vertex: 24-bit signed, degrees * 10000 (~11m precision)
+        lat0, lon0 = vertices[0]
+        lat_i = int(lat0 * 10000)
+        lon_i = int(lon0 * 10000)
+        msg.extend(lat_i.to_bytes(3, "big", signed=True))
+        msg.extend(lon_i.to_bytes(3, "big", signed=True))
 
-    # First vertex: 24-bit signed, degrees * 10000 (~11m precision)
-    lat0, lon0 = vertices[0]
-    lat_i = int(lat0 * 10000)
-    lon_i = int(lon0 * 10000)
-    msg.extend(lat_i.to_bytes(3, "big", signed=True))
-    msg.extend(lon_i.to_bytes(3, "big", signed=True))
+        # Remaining vertices: int16 delta pairs (0.001 degree units, ~110m).
+        # Range ±32.767° from first vertex — enough for any real warning.
+        for lat, lon in vertices[1:]:
+            dlat = max(-32768, min(32767, int(round((lat - lat0) / 0.001))))
+            dlon = max(-32768, min(32767, int(round((lon - lon0) / 0.001))))
+            msg.extend(struct.pack(">hh", dlat, dlon))
 
-    # Remaining vertices: int16 delta pairs (0.001 degree units, ~110m precision).
-    # Range ±32.767° from first vertex — enough for any realistic warning polygon.
-    # Previous version used int8 @ 0.01° which clamped at ±1.27° and caused
-    # vertices to pin at the edge, producing crossed lines for wider polygons.
-    for lat, lon in vertices[1:]:
-        dlat = max(-32768, min(32767, int(round((lat - lat0) / 0.001))))
-        dlon = max(-32768, min(32767, int(round((lon - lon0) / 0.001))))
-        msg.extend(struct.pack(">hh", dlat, dlon))
-
-    # Headline fills remaining space
+    # Headline fills remaining space, truncated at a word boundary
     remaining = 136 - len(msg)
-    if remaining > 0:
-        msg.extend(headline.encode("utf-8")[:remaining])
+    if remaining > 0 and headline:
+        msg.extend(_fit_headline(headline, remaining))
     return bytes(msg)
 
 
 def unpack_warning_polygon(data: bytes) -> dict:
-    """Unpack a warning polygon message."""
-    if len(data) < 5 or data[0] != MSG_WARNING:
+    """Unpack a v3 warning polygon message."""
+    if len(data) < 7 or data[0] != MSG_WARNING:
         raise ValueError("Invalid warning polygon message")
     warning_type = (data[1] >> 4) & 0x0F
     severity = data[1] & 0x0F
-    expiry = struct.unpack_from(">H", data, 2)[0]
-    vertex_count = data[4]
+    expires_unix_min = struct.unpack_from(">I", data, 2)[0]
+    vertex_count = data[6]
 
     vertices = []
-    offset = 5
+    offset = 7
     if vertex_count > 0 and offset + 6 <= len(data):
         lat0 = int.from_bytes(data[offset : offset + 3], "big", signed=True) / 10000
         lon0 = int.from_bytes(data[offset + 3 : offset + 6], "big", signed=True) / 10000
         vertices.append((lat0, lon0))
         offset += 6
-        # int16 deltas at 0.001 degree units (~110m precision)
         for _ in range(vertex_count - 1):
             if offset + 4 > len(data):
                 break
@@ -275,7 +317,7 @@ def unpack_warning_polygon(data: bytes) -> dict:
         "type": MSG_WARNING,
         "warning_type": warning_type,
         "severity": severity,
-        "expiry_minutes": expiry,
+        "expires_unix_min": expires_unix_min,
         "vertices": vertices,
         "headline": headline,
     }
@@ -688,11 +730,19 @@ def unpack_forecast(data: bytes) -> dict:
 def pack_warning_zones(
     warning_type: int,
     severity: int,
-    expiry_minutes: int,
+    expires_unix_min: int,
     zones: list[str],
     headline: str,
 ) -> bytes:
-    """Pack a zone-coded warning.
+    """Pack a zone-coded warning (v3 wire format).
+
+    Wire format:
+      byte 0     : MSG_WARNING_ZONES (0x21)
+      byte 1     : warning_type (hi nibble) | severity (lo nibble)
+      bytes 2-5  : expires_unix_min (uint32 BE)
+      byte 6     : zone_count (max 30)
+      bytes 7..  : zone_count * 3 bytes (state_idx + uint16 zone_num)
+      remainder  : headline, UTF-8, word-boundary truncated
 
     zones: list of NWS zone codes like ["TXZ192", "TXZ193"]. Max 30 per message.
     Client uses its preloaded zone polygon data to render the affected area.
@@ -700,7 +750,7 @@ def pack_warning_zones(
     msg = bytearray()
     msg.append(MSG_WARNING_ZONES)
     msg.append(((warning_type & 0x0F) << 4) | (severity & 0x0F))
-    msg.extend(struct.pack(">H", min(expiry_minutes, 0xFFFF)))
+    msg.extend(struct.pack(">I", expires_unix_min & 0xFFFFFFFF))
     msg.append(min(len(zones), 30))
 
     # Pack each zone as 3 bytes: state_idx (1) + zone_num (uint16 BE)
@@ -715,24 +765,24 @@ def pack_warning_zones(
         msg.append(state_idx & 0xFF)
         msg.extend(struct.pack(">H", zone_num & 0xFFFF))
 
-    # Headline fills remaining space
+    # Headline fills remaining space, word-boundary truncated
     remaining = 136 - len(msg)
     if remaining > 0 and headline:
-        msg.extend(headline.encode("utf-8")[:remaining])
+        msg.extend(_fit_headline(headline, remaining))
     return bytes(msg)
 
 
 def unpack_warning_zones(data: bytes) -> dict:
-    """Unpack a zone-coded warning message."""
-    if len(data) < 5 or data[0] != MSG_WARNING_ZONES:
+    """Unpack a v3 zone-coded warning message."""
+    if len(data) < 7 or data[0] != MSG_WARNING_ZONES:
         raise ValueError("Invalid zone-coded warning")
     warning_type = (data[1] >> 4) & 0x0F
     severity = data[1] & 0x0F
-    expiry = struct.unpack_from(">H", data, 2)[0]
-    zone_count = data[4]
+    expires_unix_min = struct.unpack_from(">I", data, 2)[0]
+    zone_count = data[6]
 
     zones = []
-    offset = 5
+    offset = 7
     for _ in range(zone_count):
         if offset + 3 > len(data):
             break
@@ -747,7 +797,7 @@ def unpack_warning_zones(data: bytes) -> dict:
         "type": MSG_WARNING_ZONES,
         "warning_type": warning_type,
         "severity": severity,
-        "expiry_minutes": expiry,
+        "expires_unix_min": expires_unix_min,
         "zones": zones,
         "headline": headline,
     }
@@ -988,30 +1038,35 @@ def unpack_rain_obs(data: bytes) -> dict:
     }
 
 
-# -- Warnings Near location (0x37) --
+# -- Warnings Near location (0x37) v3 --
 # Summary reply: list of warnings currently active at the given location.
-# Each entry is a reference (type, severity, zone) so the client can
+# Each entry is (type, severity, absolute expiry, zone) so the client can
 # look up the full details from its cache of previously-received 0x21/0x20.
+#
+# Per-entry layout (8 bytes):
+#   1 byte  : warning_type (hi nibble) | severity (lo nibble)
+#   4 bytes : expires_unix_min (uint32 BE)  — NWS-authoritative absolute expiry
+#   3 bytes : zone reference (state_idx + uint16 zone_num)
 
 def pack_warnings_near(
     loc_type: int,
     loc_id,
     warnings: list[dict],
 ) -> bytes:
-    """Pack a 0x37 'warnings near location' summary.
+    """Pack a 0x37 'warnings near location' summary (v3).
 
-    warnings: list of {"warning_type", "severity", "expiry_minutes", "zone"}
+    warnings: list of {"warning_type", "severity", "expires_unix_min", "zone"}
     where zone is an optional 6-char NWS zone code for quick lookup.
     """
     loc_bytes = pack_location(loc_type, loc_id)
     msg = bytearray()
     msg.append(MSG_WARNINGS_NEAR)
     msg.extend(loc_bytes)
-    max_entries = (136 - 2 - len(loc_bytes)) // 6
+    max_entries = (136 - 2 - len(loc_bytes)) // 8
     msg.append(min(len(warnings), max_entries))
     for w in warnings[:max_entries]:
         msg.append(((w.get("warning_type", WARN_OTHER) & 0x0F) << 4) | (w.get("severity", 0) & 0x0F))
-        msg.extend(struct.pack("<H", w.get("expiry_minutes", 0) & 0xFFFF))
+        msg.extend(struct.pack(">I", w.get("expires_unix_min", 0) & 0xFFFFFFFF))
         zone = w.get("zone", "")
         if len(zone) == 6 and zone[2] == "Z":
             try:
@@ -1027,7 +1082,7 @@ def pack_warnings_near(
 
 
 def unpack_warnings_near(data: bytes) -> dict:
-    """Unpack a warnings-near summary."""
+    """Unpack a v3 warnings-near summary."""
     if len(data) < 2 or data[0] != MSG_WARNINGS_NEAR:
         raise ValueError("Invalid warnings-near message")
     location, offset = unpack_location(data, 1)
@@ -1037,21 +1092,21 @@ def unpack_warnings_near(data: bytes) -> dict:
     offset += 1
     warnings = []
     for _ in range(count):
-        if offset + 6 > len(data):
+        if offset + 8 > len(data):
             break
         type_sev = data[offset]
-        expiry = struct.unpack_from("<H", data, offset + 1)[0]
-        state_idx = data[offset + 3]
-        zone_num = struct.unpack_from(">H", data, offset + 4)[0]
+        expires_unix_min = struct.unpack_from(">I", data, offset + 1)[0]
+        state_idx = data[offset + 5]
+        zone_num = struct.unpack_from(">H", data, offset + 6)[0]
         state = idx_to_state(state_idx)
         zone = f"{state}Z{zone_num:03d}" if state != "??" else ""
         warnings.append({
             "warning_type": (type_sev >> 4) & 0x0F,
             "severity": type_sev & 0x0F,
-            "expiry_minutes": expiry,
+            "expires_unix_min": expires_unix_min,
             "zone": zone,
         })
-        offset += 6
+        offset += 8
     return {
         "type": MSG_WARNINGS_NEAR,
         "location": location,

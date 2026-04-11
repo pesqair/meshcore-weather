@@ -1,13 +1,47 @@
-# MeshWX Protocol v2 — Data Message Extensions
+# MeshWX Protocol v3 — Wire Format Reference
 
 ## Context
 
-v1 of the protocol (shipped) defines three binary message types:
-- `0x01` Refresh request (client → bot via DM)
-- `0x10` Radar grid (16x16 reflectivity, broadcast)
-- `0x20` Warning polygon (variable length, broadcast)
+Canonical wire-format reference for the binary `#wx-broadcast` channel. Supersedes the earlier `MeshWX_Protocol_v2.md`. The iOS-facing binary protocol is on v3; the DM-based text-command path is unchanged and uses plain UTF-8 text.
 
-v2 adds data messages that replicate the bot's text commands (`wx`, `forecast`, `outlook`, etc.) in compact binary form so the iOS app and local web client can request and display weather data without parsing human text. The goal is **minimum airtime per useful byte**.
+Message types:
+
+| Code | Name | Direction | Added |
+|------|------|-----------|-------|
+| `0x01` | Refresh Request | client → bot (DM) | v1 |
+| `0x02` | Data Request | client → bot (DM) | v2 |
+| `0x10` | Radar Grid | bot broadcast | v1 |
+| `0x20` | Warning Polygon | bot broadcast | v1, **v3 wire format change** |
+| `0x21` | Warning Zones | bot broadcast | v2, **v3 wire format change** |
+| `0x30` | Observation | bot broadcast (DM reply) | v2 |
+| `0x31` | Forecast | bot broadcast (DM reply) | v2 |
+| `0x32` | Outlook | bot broadcast (DM reply) | v2 |
+| `0x33` | Storm Reports | bot broadcast (DM reply) | v2 |
+| `0x34` | Rain Observations | bot broadcast (DM reply) | v2 |
+| `0x35` | METAR | bot broadcast (DM reply) | v2 |
+| `0x36` | TAF | bot broadcast (DM reply) | v2 |
+| `0x37` | Warnings Near Location | bot broadcast (DM reply) | v2, **v3 wire format change** |
+| `0x40` | Text Chunk | bot broadcast | v2 |
+
+## Changes in v3 (breaking wire-format changes)
+
+1. **Absolute expiry timestamps** replace relative "minutes remaining" in `0x20`, `0x21`, and `0x37`. The field is now a `uint32` Unix-minute timestamp (minutes since 1970-01-01 UTC). Client computes time remaining from its own clock against this NWS-authoritative expiry.
+
+   *Why*: v2's relative time model required server math (`expires_at - now → minutes`) that had a subtle bug — the hand-rolled VTEC end-time parser treated the 12-char `YYMMDDTHHMMZ` string as a 6-char `DDHHMM` string and produced a fake ~363-hour expiry for any warning that crossed a day boundary. It also meant re-broadcasts showed jumping timers on the client and expired warnings were broadcast with fake 2-hour extensions. Absolute time is NWS-authoritative and can't be miscomputed.
+
+2. **Word-boundary headline truncation.** Headlines that don't fit in the remaining message bytes are truncated at the last word boundary and suffixed with `...`, never cut mid-word. Clients just decode the UTF-8 bytes directly.
+
+3. **Server sources warnings via pyIEM** (Iowa Environmental Mesonet — the reference Python parser for NWS text products) rather than hand-rolled regexes. This doesn't change any other message's wire format but affects what arrives on the wire:
+   - Polygon winding is correct (no crossed-line artifacts on wide polygons)
+   - VTEC cancellations (`CAN`/`EXP`/`UPG`) filter warnings server-side
+   - Special Weather Statements (SPS — no VTEC) now produce warnings via the UGC line's `ugcexpire`, tagged as `WARN_SPECIAL` (0x9) + `SEV_ADVISORY` (0x1)
+   - Expired warnings are dropped at extraction time (3-hour EMWIN bundle retains products ~3h past expiration — v2 rebroadcast them with fake extensions)
+
+**Not yet changed on the wire** (still v2-style, planned for later sessions — see `iOS_Developer_Brief.md`):
+- `warning_type` nibble still uses the 4-bit codes below, not the 68-entry VTEC phenomenon table
+- No separate fields for VTEC action / ETN / office / urgency / certainty
+- `0x21` still only carries Z-zone codes, not a mix of zones + county FIPS
+- `0x31` forecast source is still ZFP narrative parsing, not PFM structured data
 
 ## Design principles
 
@@ -15,7 +49,8 @@ v2 adds data messages that replicate the bot's text commands (`wx`, `forecast`, 
 2. **Structured over freeform.** Send temperature/wind/sky codes, let the client format the text. A forecast period drops from ~200 bytes of text to ~7 bytes of structured fields.
 3. **Dictionary-compressed text** for fields we can't structure (warning headlines, AFD snippets). Bundle the dictionary with clients.
 4. **One message = one LoRa frame.** 136-byte max payload. If data is larger, split into chunked messages with sequence numbers.
-5. **Back-compat.** Existing `0x10`, `0x20`, `0x01` unchanged. New types occupy the `0x30-0x40` range per the v1 spec's reserved bytes.
+5. **Absolute NWS-authoritative timestamps** over relative counters (v3). Anywhere the bot says "this is valid until T", T is a `uint32` Unix-minute timestamp.
+6. **Word-boundary text truncation** — never cut mid-word (v3).
 
 ## Preloaded client data (not transmitted)
 
@@ -52,6 +87,57 @@ State encoding for zone codes: we use a fixed 1-byte index mapping. Bundled in c
 0x00 = AL, 0x01 = AK, 0x02 = AZ, ... 0x31 = DC, 0x32 = PR, 0x33 = GU, ...
 ```
 
+## Warning type + severity encoding
+
+Warning messages (`0x20`, `0x21`, `0x37`) share a 1-byte type+severity field at offset 1:
+
+```
+bits 7..4 (high nibble): warning_type
+bits 3..0 (low nibble):  severity
+```
+
+**`warning_type` nibble** (coarse categorization, still v2-style in v3 MVP):
+```
+0x1 = WARN_TORNADO         (VTEC TO)
+0x2 = WARN_SEVERE_TSTORM   (VTEC SV, SQ, EW)
+0x3 = WARN_FLASH_FLOOD     (VTEC FF)
+0x4 = WARN_FLOOD           (VTEC FA, FL)
+0x5 = WARN_WINTER_STORM    (VTEC WS, WW, BZ, IS, LE, ZR, ZF, SN)
+0x6 = WARN_HIGH_WIND       (VTEC HW, WI)
+0x7 = WARN_FIRE            (VTEC FW)
+0x8 = WARN_MARINE          (VTEC MA, SC, SE, SR, HF, GL, SW)
+0x9 = WARN_SPECIAL         (SPS products — no VTEC)
+0xF = WARN_OTHER
+```
+
+**`severity` nibble** (client uses for display color / notification policy):
+```
+0x1 = SEV_ADVISORY
+0x2 = SEV_WATCH
+0x3 = SEV_WARNING
+0x4 = SEV_EMERGENCY
+```
+
+Future v3 extensions will replace this with a 1-byte canonical VTEC phenomenon index + separate CAP severity/urgency/certainty fields. For the current MVP, stick with the 4-bit codes above.
+
+## Absolute expiry timestamp format
+
+Every warning message carries a `uint32 expires_unix_min` at bytes 2-5:
+
+```
+bytes 2-5: uint32 BE  — absolute expiry as minutes since Unix epoch (1970-01-01 UTC)
+```
+
+This is the NWS-authoritative expiry straight from pyIEM's VTEC parsing (or the UGC-line `ugcexpire` for non-VTEC products like SPS). The client computes time remaining from its own clock:
+
+```
+remaining_min = (expires_unix_min * 60 - client_now_unix_sec) / 60
+```
+
+If `remaining_min <= 0` the warning has expired and should be dropped from display.
+
+`uint32` of minutes since 1970 is good until the year 10136 — no Y2K38 concern (that's a seconds-based issue).
+
 ## Message types
 
 ### `0x02` — Data Request (client → bot via DM)
@@ -72,6 +158,69 @@ Offset  Size  Field
 ```
 
 Total: 7-11 bytes. Bot broadcasts the response on `#wx-broadcast` (so other listeners benefit).
+
+### `0x20` — Warning Polygon (bot broadcast)
+
+Full warning with a geographic polygon. Used when the warning has no UGC zone codes (rare) or when the operator wants explicit geometry. For multi-zone warnings, `0x21` is preferred (smaller and rendered from preloaded canonical zone polygons).
+
+**Wire format (v3):**
+
+```
+Offset  Size  Field
+0       1     0x20  MSG_WARNING
+1       1     warning_type (hi nibble) | severity (lo nibble)
+2       4     expires_unix_min (uint32 BE)  — NWS absolute expiry
+6       1     vertex_count (uint8)
+7       6     first vertex:
+                int24 BE  lat × 10000  (~11m precision)
+                int24 BE  lon × 10000
+13..    4     per remaining vertex: (vertex_count - 1) × 4 bytes
+                int16 BE  dlat × 1000  (~110m precision, ±32.767° from lat0)
+                int16 BE  dlon × 1000
+then    ..    headline, UTF-8, word-boundary truncated with "..." suffix
+              (fills the remaining bytes up to the 136-byte frame limit)
+```
+
+**Sizing:**
+- 3 vertex polygon + 50 byte headline ≈ **64 bytes**
+- 20 vertex polygon fills the frame with minimal headline room
+
+**v3 changes from v2:**
+- Bytes 2-5 were `uint16 expiry_minutes` (relative, 2 bytes) → now `uint32 expires_unix_min` (absolute, 4 bytes)
+- Vertex count moved from byte 4 → byte 6 (as a consequence)
+- Headline is word-boundary truncated rather than raw-byte truncated
+
+**Delta encoding rationale**: The first vertex is a full int24-precision coordinate; subsequent vertices are int16 deltas at 0.001° units (±32.767° span from the first vertex). This is ~4 bytes per vertex instead of 6, and handles any realistic NWS warning polygon. v1 used int8 deltas at 0.01° which clamped at ±1.27° and produced crossed lines on wide polygons.
+
+### `0x21` — Warning Zones (bot broadcast)
+
+Zone-coded warning — the preferred form for warnings with UGC zone codes. Much smaller than polygon encoding for multi-zone warnings, and renders from the client's preloaded canonical zone polygons (no delta-encoding artifacts).
+
+**Wire format (v3):**
+
+```
+Offset  Size  Field
+0       1     0x21  MSG_WARNING_ZONES
+1       1     warning_type (hi nibble) | severity (lo nibble)
+2       4     expires_unix_min (uint32 BE)
+6       1     zone_count (uint8, max 30)
+7       3     per zone (zone_count × 3 bytes):
+                state_idx (uint8, index into bundled state_index.json)
+                zone_num  (uint16 BE, e.g. 192 for TXZ192)
+then    ..    headline, UTF-8, word-boundary truncated with "..." suffix
+```
+
+**Sizing:**
+- 5 zones + 30 byte headline ≈ **55 bytes**
+- 14 zones + 60 byte headline ≈ **~110 bytes**
+
+**Client rendering**: Reconstruct each `{state}Z{zone_num:03d}` code, look up the polygon in `zones.geojson`, render as an overlay. The bot never ships zone geometry over the air — clients bundle it once.
+
+**v3 changes from v2:**
+- Bytes 2-5 were `uint16 expiry_minutes` → now `uint32 expires_unix_min`
+- Zone count moved from byte 4 → byte 6
+
+**Note**: The v3 MVP still only accepts Z-zone codes here. A future v3 revision will extend this to mix Z (forecast zones) and C (county FIPS) codes in a single message, matching what pyIEM extracts from the UGC line.
 
 ### `0x30` — Observation (wx reply)
 
@@ -222,23 +371,35 @@ Offset  Size  Field
 
 Structured forecast for a station. Like 0x31 but with TAF-specific fields (ceiling in ft, visibility in SM, specific wx codes).
 
-### `0x37` — Warnings near location
+### `0x37` — Warnings Near Location
 
-Response to a "warnings near me" query. Contains a list of warning references (type, severity, zone code) that the client looks up in its warning cache.
+Response to a "warnings near me" query. Contains a list of active warning references (type, severity, absolute expiry, zone code) for the client to display as a quick summary. Clients can cross-reference each entry against full warning messages (`0x20`/`0x21`) previously received on the channel.
+
+**Wire format (v3):**
 
 ```
 Offset  Size  Field
-0       1     0x37
-1       1     location_type
-2       N     location_id
-N+2     1     warning_count (uint8)
+0       1     0x37  MSG_WARNINGS_NEAR
+1       N     location reference (type-tagged; typically 4 bytes for a zone)
+N+1     1     entry count (uint8)
 
-Per warning (5 bytes):
-  +0    1     type (high nibble) | severity (low nibble)
-  +1    2     expiry_minutes (uint16 LE)
-  +3    2     headline_hash (uint16) — client uses this to look up a
-              previously-received full warning polygon (0x20)
+Per entry (8 bytes):
+  +0    1     warning_type (hi nibble) | severity (lo nibble)
+  +1    4     expires_unix_min (uint32 BE)  — NWS absolute expiry
+  +5    3     zone reference:
+                state_idx (uint8)
+                zone_num  (uint16 BE)
 ```
+
+**Sizing:**
+- 4-byte zone location + 1 byte count + 8 bytes per entry
+- Max entries in a 136-byte frame: `(136 - 2 - 4) // 8 = ~16` warnings per message
+
+**v3 changes from v2:**
+- Per-entry grew from 6 bytes → 8 bytes
+- Per-entry bytes 1-2 were `uint16 expiry_minutes` (LE!) → now `uint32 expires_unix_min` (BE)
+- Removed the `headline_hash` field (it was never implemented on either side)
+- Added explicit 3-byte zone reference (state_idx + uint16 zone_num) so the client can correlate with cached `0x21` messages without guesswork
 
 This is the "I'm near this location, what do I need to know" quick reply.
 

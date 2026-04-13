@@ -120,6 +120,10 @@ class BroadcastConfig(BaseModel):
 
     version: int = Field(1, description="Schema version")
     jobs: list[BroadcastJob] = Field(default_factory=list)
+    radar_grid_size: int = Field(
+        64,
+        description="Default radar grid size for on-demand requests (16, 32, or 64)",
+    )
 
     def get_job(self, job_id: str) -> BroadcastJob | None:
         """Look up a job by ID; returns None if not found."""

@@ -226,15 +226,55 @@ Uses the same sparse/RLE encoding, same chunking, same FEC quadrants as radar. R
 
 ---
 
-## 5. Existing v3 types (unchanged on v4 channel)
+## 5. Warning format (0x20 polygon, 0x21 zones)
 
-These arrive with the v4 header but their payload is identical to v3. Unwrap the header, prepend msg_type, and use existing decoders:
+Warnings now include an **onset time** so the client can distinguish active vs upcoming:
+
+**0x20 Warning Polygon:**
+```
+byte 0      : 0x20
+byte 1      : warning_type (hi nibble) | severity (lo nibble)
+bytes 2-5   : expires_unix_min (uint32 BE)
+bytes 6-9   : onset_unix_min (uint32 BE, 0 = effective immediately)
+byte 10     : vertex_count
+bytes 11+   : vertices (first: 6B int24 lat/lon * 10000, rest: 4B int16 deltas)
+remainder   : headline (UTF-8)
+```
+
+**0x21 Warning Zones:**
+```
+byte 0      : 0x21
+byte 1      : warning_type (hi nibble) | severity (lo nibble)
+bytes 2-5   : expires_unix_min (uint32 BE)
+bytes 6-9   : onset_unix_min (uint32 BE, 0 = effective immediately)
+byte 10     : zone_count
+bytes 11+   : zone_count * 3B (state_idx + uint16 zone_num BE)
+remainder   : headline (UTF-8)
+```
+
+**Client logic:**
+```swift
+let now = UInt32(Date().timeIntervalSince1970 / 60)
+if onset == 0 || now >= onset {
+    // Active now — show as red/orange
+} else {
+    // Upcoming — show as yellow, display "Starts at <onset time>"
+}
+```
+
+**Warning type nibbles:** 0x1=tornado, 0x2=severe tstorm, 0x3=flash flood, 0x4=flood, 0x5=winter storm, 0x6=high wind, 0x7=fire, 0x8=marine, 0x9=special, 0xF=other
+
+**Severity nibbles:** 0x1=advisory, 0x2=watch, 0x3=warning, 0x4=emergency
+
+---
+
+## 5b. Other existing types on v4 channel
+
+These arrive with the v4 header. Unwrap the header, prepend msg_type, and use existing decoders:
 
 | Type | Code | Notes |
 |------|------|-------|
 | Radar compressed | 0x11 | 32x32 non-FEC or individual FEC unit |
-| Warning polygon | 0x20 | Now also carries SPC watch polygons |
-| Warning zones | 0x21 | Now also carries SPC WOU zone lists |
 | Observation | 0x30 | Unchanged |
 | Forecast | 0x31 | May be sourced from SFT (nationwide) in addition to PFM/ZFP |
 | Outlook | 0x32 | Unchanged |

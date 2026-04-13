@@ -529,17 +529,16 @@ def _fit_headline(headline: str, max_bytes: int) -> bytes:
     return (truncated + "...").encode("utf-8")
 
 
-# -- Warning Polygon (0x20) v3 -- variable, max 136 bytes --
+# -- Warning Polygon (0x20) v4 -- variable, max 136 bytes --
 #
-# Wire format (v3 — breaking change from v2):
+# Wire format (v4 — adds onset time):
 #   byte 0     : MSG_WARNING (0x20)
 #   byte 1     : warning_type (hi nibble) | severity (lo nibble)
 #   bytes 2-5  : expires_unix_min (uint32 BE, minutes since Unix epoch)
-#                NWS-authoritative absolute expiry. Client computes time
-#                remaining from its own clock. Replaces v2's uint16
-#                "expiry_minutes" relative counter.
-#   byte 6     : vertex_count
-#   bytes 7..  : first vertex (6B int24 lat, int24 lon * 10000)
+#   bytes 6-9  : onset_unix_min (uint32 BE, when warning becomes active)
+#                Client: if now < onset → "upcoming", if now >= onset → "active"
+#   byte 10    : vertex_count
+#   bytes 11.. : first vertex (6B int24 lat, int24 lon * 10000)
 #                then (vertex_count-1) * 4 bytes of int16 delta pairs
 #   remainder  : headline, UTF-8, truncated at word boundary with "..."
 
@@ -549,8 +548,9 @@ def pack_warning_polygon(
     expires_unix_min: int,
     vertices: list[tuple[float, float]],
     headline: str,
+    onset_unix_min: int = 0,
 ) -> bytes:
-    """Pack a warning polygon into wire format v3 (max 136 bytes).
+    """Pack a warning polygon into wire format (max 136 bytes).
 
     Args:
         warning_type: 4-bit type nibble (WARN_TORNADO, WARN_SEVERE_TSTORM, ...).
@@ -558,11 +558,13 @@ def pack_warning_polygon(
         expires_unix_min: NWS expiry as uint32 Unix minutes (minutes since 1970).
         vertices: list of (lat, lon) in decimal degrees.
         headline: short text for the client to display.
+        onset_unix_min: when the warning becomes active (0 = effective immediately).
     """
     msg = bytearray()
     msg.append(MSG_WARNING)
     msg.append(((warning_type & 0x0F) << 4) | (severity & 0x0F))
     msg.extend(struct.pack(">I", expires_unix_min & 0xFFFFFFFF))
+    msg.extend(struct.pack(">I", onset_unix_min & 0xFFFFFFFF))
     msg.append(len(vertices) & 0xFF)
 
     if vertices:
@@ -588,16 +590,17 @@ def pack_warning_polygon(
 
 
 def unpack_warning_polygon(data: bytes) -> dict:
-    """Unpack a v3 warning polygon message."""
-    if len(data) < 7 or data[0] != MSG_WARNING:
+    """Unpack a warning polygon message."""
+    if len(data) < 11 or data[0] != MSG_WARNING:
         raise ValueError("Invalid warning polygon message")
     warning_type = (data[1] >> 4) & 0x0F
     severity = data[1] & 0x0F
     expires_unix_min = struct.unpack_from(">I", data, 2)[0]
-    vertex_count = data[6]
+    onset_unix_min = struct.unpack_from(">I", data, 6)[0]
+    vertex_count = data[10]
 
     vertices = []
-    offset = 7
+    offset = 11
     if vertex_count > 0 and offset + 6 <= len(data):
         lat0 = int.from_bytes(data[offset : offset + 3], "big", signed=True) / 10000
         lon0 = int.from_bytes(data[offset + 3 : offset + 6], "big", signed=True) / 10000
@@ -616,6 +619,7 @@ def unpack_warning_polygon(data: bytes) -> dict:
         "warning_type": warning_type,
         "severity": severity,
         "expires_unix_min": expires_unix_min,
+        "onset_unix_min": onset_unix_min,
         "vertices": vertices,
         "headline": headline,
     }
@@ -1111,28 +1115,31 @@ def pack_warning_zones(
     expires_unix_min: int,
     zones: list[str],
     headline: str,
+    onset_unix_min: int = 0,
 ) -> bytes:
-    """Pack a zone-coded warning (v3 wire format).
+    """Pack a zone-coded warning.
 
     Wire format:
-      byte 0     : MSG_WARNING_ZONES (0x21)
-      byte 1     : warning_type (hi nibble) | severity (lo nibble)
-      bytes 2-5  : expires_unix_min (uint32 BE)
-      byte 6     : zone_count (max 30)
-      bytes 7..  : zone_count * 3 bytes (state_idx + uint16 zone_num)
-      remainder  : headline, UTF-8, word-boundary truncated
+      byte 0      : MSG_WARNING_ZONES (0x21)
+      byte 1      : warning_type (hi nibble) | severity (lo nibble)
+      bytes 2-5   : expires_unix_min (uint32 BE)
+      bytes 6-9   : onset_unix_min (uint32 BE, 0 = effective immediately)
+      byte 10     : zone_count (max 28)
+      bytes 11..  : zone_count * 3 bytes (state_idx + uint16 zone_num)
+      remainder   : headline, UTF-8, word-boundary truncated
 
-    zones: list of NWS zone codes like ["TXZ192", "TXZ193"]. Max 30 per message.
+    zones: list of NWS zone codes like ["TXZ192", "TXZ193"].
     Client uses its preloaded zone polygon data to render the affected area.
     """
     msg = bytearray()
     msg.append(MSG_WARNING_ZONES)
     msg.append(((warning_type & 0x0F) << 4) | (severity & 0x0F))
     msg.extend(struct.pack(">I", expires_unix_min & 0xFFFFFFFF))
-    msg.append(min(len(zones), 30))
+    msg.extend(struct.pack(">I", onset_unix_min & 0xFFFFFFFF))
+    msg.append(min(len(zones), 28))
 
     # Pack each zone as 3 bytes: state_idx (1) + zone_num (uint16 BE)
-    for zone_code in zones[:30]:
+    for zone_code in zones[:28]:
         if len(zone_code) != 6 or zone_code[2] != "Z":
             continue
         try:
@@ -1151,16 +1158,17 @@ def pack_warning_zones(
 
 
 def unpack_warning_zones(data: bytes) -> dict:
-    """Unpack a v3 zone-coded warning message."""
-    if len(data) < 7 or data[0] != MSG_WARNING_ZONES:
+    """Unpack a zone-coded warning message."""
+    if len(data) < 11 or data[0] != MSG_WARNING_ZONES:
         raise ValueError("Invalid zone-coded warning")
     warning_type = (data[1] >> 4) & 0x0F
     severity = data[1] & 0x0F
     expires_unix_min = struct.unpack_from(">I", data, 2)[0]
-    zone_count = data[6]
+    onset_unix_min = struct.unpack_from(">I", data, 6)[0]
+    zone_count = data[10]
 
     zones = []
-    offset = 7
+    offset = 11
     for _ in range(zone_count):
         if offset + 3 > len(data):
             break
@@ -1176,6 +1184,7 @@ def unpack_warning_zones(data: bytes) -> dict:
         "warning_type": warning_type,
         "severity": severity,
         "expires_unix_min": expires_unix_min,
+        "onset_unix_min": onset_unix_min,
         "zones": zones,
         "headline": headline,
     }

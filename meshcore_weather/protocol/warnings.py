@@ -268,6 +268,7 @@ def _segment_to_entry(seg, parsed, prod, now: datetime) -> dict | None:
         if expires_at <= now:
             return None  # already expired
 
+        onset_at = vtec.begints  # when the warning becomes active
         wtype = VTEC_PHENOMENON_TO_WARN_TYPE.get(vtec.phenomena, WARN_OTHER)
         severity = VTEC_SEVERITY_MAP.get(vtec.significance, SEV_WARNING)
         dedup_key = (vtec.phenomena, vtec.significance, vtec.office, vtec.etn)
@@ -284,6 +285,7 @@ def _segment_to_entry(seg, parsed, prod, now: datetime) -> dict | None:
         if expires_at is None or expires_at <= now:
             return None
 
+        onset_at = parsed.valid  # effective immediately for non-VTEC
         wtype = WARN_SPECIAL
         severity = SEV_ADVISORY
         # Dedup by (office, type, valid time) — SPS doesn't have ETNs.
@@ -312,10 +314,14 @@ def _segment_to_entry(seg, parsed, prod, now: datetime) -> dict | None:
 
     expiry_minutes = max(0, int((expires_at - now).total_seconds() / 60))
 
+    onset_unix_min = int(onset_at.timestamp() / 60) if onset_at else 0
+
     entry = {
         # Wire-format fields (consumed by warnings_to_binary)
         "warning_type": wtype,
         "severity": severity,
+        "onset_at": onset_at,          # when the warning becomes active (None = immediate)
+        "onset_unix_min": onset_unix_min,
         "expires_at": expires_at,      # canonical absolute expiry (NWS-authoritative)
         "expiry_minutes": expiry_minutes,  # convenience — minutes from "now"
         "vertices": vertices,
@@ -398,9 +404,14 @@ def _extract_warnings_fallback(store: WeatherStore) -> list[dict]:
 
         expiry_minutes = max(0, int((expires_at - now).total_seconds() / 60))
 
+        # Fallback path has no VTEC onset; assume effective immediately
+        onset_at = now
+
         results.append({
             "warning_type": wtype,
             "severity": severity,
+            "onset_at": onset_at,
+            "onset_unix_min": int(onset_at.timestamp() / 60),
             "expires_at": expires_at,
             "expiry_minutes": expiry_minutes,
             "vertices": vertices,
@@ -472,6 +483,7 @@ def warnings_to_binary(warnings: list[dict], prefer_zones: bool = True) -> list[
                 continue
             expires_unix_min = int(expires_at.timestamp() / 60)
 
+            onset_unix_min = w.get("onset_unix_min", 0)
             zones = w.get("zones", [])
             if prefer_zones and zones:
                 msg = pack_warning_zones(
@@ -480,6 +492,7 @@ def warnings_to_binary(warnings: list[dict], prefer_zones: bool = True) -> list[
                     expires_unix_min=expires_unix_min,
                     zones=zones,
                     headline=w["headline"],
+                    onset_unix_min=onset_unix_min,
                 )
             elif w.get("vertices"):
                 msg = pack_warning_polygon(
@@ -488,6 +501,7 @@ def warnings_to_binary(warnings: list[dict], prefer_zones: bool = True) -> list[
                     expires_unix_min=expires_unix_min,
                     vertices=w["vertices"],
                     headline=w["headline"],
+                    onset_unix_min=onset_unix_min,
                 )
             else:
                 continue

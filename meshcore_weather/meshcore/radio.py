@@ -33,6 +33,12 @@ class MeshcoreRadio:
         self._advert_handler: Callable | None = None
         self._advert_task: asyncio.Task | None = None
         self._contacts_task: asyncio.Task | None = None
+        # Shared send lock — prevents the scheduler and on-demand
+        # request handler from interleaving messages on the data channel.
+        # Without this, a client DM triggering respond_to_data_request
+        # while the scheduler is mid-tick sending radar chunks would
+        # cause mixed messages on the wire.
+        self.send_lock: asyncio.Lock = asyncio.Lock()
 
     def on_channel_message(self, handler: Callable) -> None:
         """Register handler: async def handler(channel, sender_name, text)"""
@@ -198,28 +204,35 @@ class MeshcoreRadio:
     async def send_binary_channel(self, payload: bytes) -> None:
         """Send raw binary data on the MeshWX data channel.
 
+        Acquires the shared send_lock so that scheduled broadcasts and
+        on-demand request responses never interleave their messages.
+        Without this, a client DM arriving mid-broadcast-tick would
+        cause mixed message sequences on the wire (e.g., radar chunk 3
+        followed by a forecast response followed by radar chunk 4).
+
         Bypasses send_chan_msg (which UTF-8 encodes) by constructing
         the channel message packet directly with raw bytes.
         """
         if not self._mc or self._data_channel_idx is None:
             return
-        import time as _time
-        ts_bytes = int(_time.time()).to_bytes(4, "little")
-        data = (
-            b"\x03\x00"
-            + self._data_channel_idx.to_bytes(1, "little")
-            + ts_bytes
-            + payload
-        )
-        try:
-            result = await self._mc.commands.send(data, [EventType.OK, EventType.ERROR])
-            if result.type == EventType.ERROR:
-                logger.warning("Binary send failed on data ch %d: %s", self._data_channel_idx, result.payload)
-            else:
-                logger.info("Binary sent on ch %d: %d bytes (type 0x%02x)",
-                            self._data_channel_idx, len(payload), payload[0] if payload else 0)
-        except Exception:
-            logger.exception("Failed to send binary on data channel")
+        async with self.send_lock:
+            import time as _time
+            ts_bytes = int(_time.time()).to_bytes(4, "little")
+            data = (
+                b"\x03\x00"
+                + self._data_channel_idx.to_bytes(1, "little")
+                + ts_bytes
+                + payload
+            )
+            try:
+                result = await self._mc.commands.send(data, [EventType.OK, EventType.ERROR])
+                if result.type == EventType.ERROR:
+                    logger.warning("Binary send failed on data ch %d: %s", self._data_channel_idx, result.payload)
+                else:
+                    logger.info("Binary sent on ch %d: %d bytes (type 0x%02x)",
+                                self._data_channel_idx, len(payload), payload[0] if payload else 0)
+            except Exception:
+                logger.exception("Failed to send binary on data channel")
 
     async def send_dm(self, pubkey_prefix: str, text: str) -> bool:
         """Send a direct message to a contact by their public key prefix."""

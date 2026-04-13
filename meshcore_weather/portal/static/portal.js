@@ -352,11 +352,12 @@ var Portal = {
 
     loadActivity: function () {
       var self = this;
-      // Load the backlog via REST, then switch to SSE for real-time
+      // Load the backlog via REST — real-time updates come from the
+      // global activityPanel SSE stream which feeds BOTH the panel
+      // AND this Overview section's activity table.
       fetch("/api/activity?limit=100").then(function (r) { return r.json(); }).then(function (data) {
         var tbody = document.getElementById("activity-body");
         var events = data.events || [];
-        self._activityCount = events.length;
         document.getElementById("activity-log-count").textContent =
           events.length + " events (live)";
         if (!events.length) {
@@ -366,61 +367,10 @@ var Portal = {
             return self._renderActivityRow(e);
           }).join("");
         }
-        // Start SSE stream for real-time updates
-        self._startActivitySSE();
       }).catch(function () {
         document.getElementById("activity-body").innerHTML =
           '<tr><td colspan="4" class="text-muted">Load failed</td></tr>';
       });
-    },
-
-    _startActivitySSE: function () {
-      var self = this;
-      // Close any existing connection
-      if (this._activitySSE) {
-        this._activitySSE.close();
-        this._activitySSE = null;
-      }
-      var es = new EventSource("/api/activity/stream");
-      this._activitySSE = es;
-
-      es.onmessage = function (msg) {
-        try {
-          var e = JSON.parse(msg.data);
-          var tbody = document.getElementById("activity-body");
-          if (!tbody) return;
-          // Remove the "no activity yet" placeholder if present
-          var firstCell = tbody.querySelector("td.text-muted");
-          if (firstCell && firstCell.colSpan === 4) {
-            tbody.innerHTML = "";
-          }
-          // Prepend new row at the top
-          var tempDiv = document.createElement("div");
-          tempDiv.innerHTML = '<table><tbody>' + self._renderActivityRow(e) + '</tbody></table>';
-          var newRow = tempDiv.querySelector("tr");
-          if (newRow) {
-            // Flash effect for new rows
-            newRow.style.backgroundColor = "rgba(0, 150, 255, 0.15)";
-            tbody.insertBefore(newRow, tbody.firstChild);
-            setTimeout(function () { newRow.style.backgroundColor = ""; }, 1500);
-          }
-          self._activityCount++;
-          document.getElementById("activity-log-count").textContent =
-            self._activityCount + " events (live)";
-          // Trim old rows to prevent DOM bloat
-          while (tbody.children.length > self._MAX_ACTIVITY_ROWS) {
-            tbody.removeChild(tbody.lastChild);
-          }
-        } catch (err) {
-          // Ignore parse errors from malformed SSE data
-        }
-      };
-
-      es.onerror = function () {
-        // SSE connection lost — will auto-reconnect (browser default)
-        document.getElementById("activity-log-count").textContent =
-          self._activityCount + " events (reconnecting...)";
-      };
     },
 
     loadStats: function () {
@@ -1115,11 +1065,122 @@ var Portal = {
 
   // -- Init -----------------------------------------------------------------
 
+  // -- Persistent Activity Panel (visible on all pages) ----------------------
+
+  activityPanel: {
+    _sse: null,
+    _count: 0,
+    _MAX_ROWS: 150,
+
+    init: function () {
+      var self = this;
+      // Load backlog then start SSE
+      fetch("/api/activity?limit=50").then(function (r) { return r.json(); }).then(function (data) {
+        var events = data.events || [];
+        var tbody = document.getElementById("panel-activity-body");
+        self._count = events.length;
+        if (!events.length) {
+          tbody.innerHTML = '<tr><td colspan="4" class="text-muted">Waiting for events...</td></tr>';
+        } else {
+          tbody.innerHTML = events.map(function (e) { return self._row(e); }).join("");
+        }
+        self._updateCount();
+        self._startSSE();
+      }).catch(function () {});
+    },
+
+    toggle: function () {
+      var panel = document.getElementById("activity-panel");
+      if (panel.classList.contains("expanded")) {
+        panel.classList.remove("expanded");
+        panel.classList.add("collapsed");
+      } else {
+        panel.classList.remove("collapsed");
+        panel.classList.add("expanded");
+      }
+    },
+
+    _row: function (e) {
+      var ts = new Date((e.ts || 0) * 1000);
+      var time = ts.toLocaleTimeString();
+      var dir = e.direction === "in"
+        ? '<span class="badge badge-success">IN</span>'
+        : '<span class="badge badge-muted">OUT</span>';
+      var labels = {
+        v2_request: "Request", v2_response: "Response", v1_refresh: "Refresh",
+        broadcast: "Broadcast", throttled: "Throttled", send_fail: "Send Fail",
+      };
+      var type = labels[e.event_type] || e.event_type;
+      return '<tr><td class="text-muted">' + time + '</td><td>' + dir +
+        '</td><td>' + escapeHtml(type) + '</td><td>' + escapeHtml(e.summary) + '</td></tr>';
+    },
+
+    _updateCount: function () {
+      var el = document.getElementById("panel-event-count");
+      if (el) el.textContent = "(" + this._count + " events)";
+    },
+
+    _startSSE: function () {
+      if (this._sse) { this._sse.close(); this._sse = null; }
+      var self = this;
+      var es = new EventSource("/api/activity/stream");
+      this._sse = es;
+
+      es.onmessage = function (msg) {
+        try {
+          var e = JSON.parse(msg.data);
+          var tbody = document.getElementById("panel-activity-body");
+          if (!tbody) return;
+          // Remove placeholder
+          var ph = tbody.querySelector("td[colspan]");
+          if (ph) tbody.innerHTML = "";
+          // Prepend
+          var tmp = document.createElement("div");
+          tmp.innerHTML = '<table><tbody>' + self._row(e) + '</tbody></table>';
+          var tr = tmp.querySelector("tr");
+          if (tr) {
+            tr.classList.add("row-new");
+            tbody.insertBefore(tr, tbody.firstChild);
+          }
+          self._count++;
+          self._updateCount();
+          // Trim
+          while (tbody.children.length > self._MAX_ROWS) tbody.removeChild(tbody.lastChild);
+
+          // Also update the Overview page's activity log if it exists
+          var overviewBody = document.getElementById("activity-body");
+          if (overviewBody && overviewBody !== tbody) {
+            var tmp2 = document.createElement("div");
+            tmp2.innerHTML = '<table><tbody>' + Portal.overview._renderActivityRow(e) + '</tbody></table>';
+            var tr2 = tmp2.querySelector("tr");
+            if (tr2) {
+              tr2.style.backgroundColor = "rgba(0, 150, 255, 0.15)";
+              overviewBody.insertBefore(tr2, overviewBody.firstChild);
+              setTimeout(function () { tr2.style.backgroundColor = ""; }, 1500);
+            }
+            while (overviewBody.children.length > 200) overviewBody.removeChild(overviewBody.lastChild);
+            var countEl = document.getElementById("activity-log-count");
+            if (countEl) countEl.textContent = overviewBody.children.length + " events (live)";
+          }
+        } catch (err) {}
+      };
+
+      es.onerror = function () {
+        var el = document.getElementById("panel-event-count");
+        if (el) el.textContent = "(reconnecting...)";
+      };
+      es.onopen = function () { self._updateCount(); };
+    },
+  },
+
   init: function () {
     var boot = window.__BOOT__ || {};
 
     // Render overview from boot data immediately
     this.overview.render(boot);
+
+    // Start the persistent activity panel SSE stream
+    this.activityPanel.init();
 
     // Map init is lazy — created on first visit to #map section
     // (MapLibre throws if container has 0 dimensions while hidden)

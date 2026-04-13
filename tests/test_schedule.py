@@ -327,6 +327,7 @@ class TestSchedulerTick:
 
         store = WeatherStore()
         radio = MagicMock()
+        radio.send_lock = asyncio.Lock()
         radio.send_binary_channel = AsyncMock()
         sched = Scheduler(store, radio)
 
@@ -369,6 +370,7 @@ class TestSchedulerTick:
 
         store = WeatherStore()
         radio = MagicMock()
+        radio.send_lock = asyncio.Lock()
         radio.send_binary_channel = AsyncMock()
         sched = Scheduler(store, radio)
 
@@ -426,6 +428,7 @@ class TestSchedulerTick:
 
         store = WeatherStore()
         radio = MagicMock()
+        radio.send_lock = asyncio.Lock()
         radio.send_binary_channel = AsyncMock()
         sched = Scheduler(store, radio)
         await sched._reload_config()
@@ -450,6 +453,8 @@ class TestBroadcasterNotAvailable:
 
         store = WeatherStore()  # empty — no data to find
         radio = MagicMock()
+        radio.send_lock = asyncio.Lock()
+        radio.send_lock = asyncio.Lock()
         sent = []
 
         async def cap(p):

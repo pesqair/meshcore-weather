@@ -1,6 +1,6 @@
 # MeshWX Protocol v4 Design
 
-> **Status: partially implemented.** The v4 frame header, dual-broadcast, and FEC/XOR parity are implemented. The scheduler sends every product on both v3 and v4 channels — simple products get v4 frame wrapping, while 64×64 radar gets spatial quadrant FEC (base layer + 4 quadrants + XOR parity = 6 messages) and AFD gets per-section FEC (synopsis base + section units + XOR parity). New v4 products (FWF, RTP, NOW, SFT, SPC WOU/SEL, QPF) have parsers, wire encoders, and scheduler integration. Channel configuration is available in the portal System section. Still design-only: discovery beacon and multi-bot support.
+> **Status: implemented.** v4 frame header with sequence numbers, FEC/XOR parity (radar quadrants + AFD sections), discovery via ping-response on `#meshwx-discover`, new products (FWF, RTP, NOW, SFT, SPC WOU/SEL, QPF), and portal channel configuration are all implemented. The data channel is v4-only. Multi-bot roaming (auto-switching between bots based on signal/location) is not yet implemented but the discovery mechanism supports it.
 
 ---
 
@@ -29,7 +29,16 @@ v3 works but has structural limitations:
 
 ### Discovery channel (`#meshwx-discover`)
 
-Every bot announces itself every **2 hours** with a small beacon. Clients join this one channel to find nearby bots.
+Ping-response model: the client sends a discovery ping, all bots respond with their beacon. No periodic broadcasting — zero airtime cost until a client asks.
+
+**Client → bots: ping (0xF1)**
+
+```
+0xF1 MSG_DISCOVER_PING
+  (no payload — any message on #meshwx-discover triggers all bots to respond)
+```
+
+**Bots → client: beacon response (0xF0)**
 
 ```
 0xF0 MSG_BEACON (~25-35 bytes)
@@ -41,7 +50,9 @@ Every bot announces itself every **2 hours** with a small beacon. Clients join t
                  bit 1: has_radar
                  bit 2: has_warnings
                  bit 3: has_forecasts
-                 bit 4: has_space_weather
+                 bit 4: has_fire_weather
+                 bit 5: has_nowcast
+                 bit 6: has_qpf
   bytes 6-9  : coverage center (int16 lat × 100, int16 lon × 100)
   byte 10    : coverage_radius_km (uint8)
   byte 11    : active_warnings_count (uint8)
@@ -49,9 +60,15 @@ Every bot announces itself every **2 hours** with a small beacon. Clients join t
   bytes 13+  : channel_name UTF-8 (e.g. "aus-meshwx-v4")
 ```
 
-Beacon interval: **every 2 hours.** The discovery channel should be quiet — clients listen passively and may need to wait up to 2 hours to hear all nearby bots. This is acceptable because discovery is a one-time setup step, not a real-time operation.
+**Flow:**
 
-No capabilities bitmap beyond the beacon_flags. Keep it simple — the flags tell the client "this bot has radar" vs "this bot is text-only." The client can query for detailed capabilities after joining the deployment channel.
+1. Client joins `#meshwx-discover` and sends a 0xF1 ping
+2. Each bot responds with its 0xF0 beacon after a random 1-5s delay (prevents air collisions)
+3. Client collects responses for ~10 seconds, presents a list of nearby bots
+4. User picks a bot → client joins that bot's data channel (from `channel_name`)
+5. Client can leave `#meshwx-discover` to free the channel slot
+
+The beacon flags tell the client what products each bot offers before joining. The `active_warnings_count` lets the client show "3 active warnings" next to the bot name in the picker UI.
 
 ### Deployment channel
 

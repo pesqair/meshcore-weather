@@ -247,7 +247,67 @@ These arrive with the v4 header but their payload is identical to v3. Unwrap the
 
 ---
 
-## 6. Location encoding reference
+## 6. Discovery (finding bots)
+
+The client finds nearby bots by pinging `#meshwx-discover`. All bots respond with their beacon.
+
+### Step 1: Client sends a ping
+
+Join `#meshwx-discover` and send any message (a single 0xF1 byte, or even just text — any message triggers all bots to respond).
+
+### Step 2: Collect beacon responses (~10 seconds)
+
+Each bot responds with a 0xF0 beacon after a random 1-5s delay:
+
+```
+byte 0     : 0xF0 (MSG_BEACON)
+byte 1     : 0x04 (protocol version)
+bytes 2-4  : bot_id (uint24 BE — unique per deployment)
+byte 5     : beacon_flags
+               bit 0: accepting_requests
+               bit 1: has_radar
+               bit 2: has_warnings
+               bit 3: has_forecasts
+               bit 4: has_fire_weather
+               bit 5: has_nowcast
+               bit 6: has_qpf
+bytes 6-7  : lat (int16 BE, degrees × 100)
+bytes 8-9  : lon (int16 BE, degrees × 100)
+byte 10    : coverage_radius_km (uint8)
+byte 11    : active_warnings_count (uint8)
+byte 12    : channel_name_len (uint8)
+bytes 13+  : channel_name (UTF-8, e.g. "aus-meshwx-v4")
+```
+
+Parse beacon_flags in Swift:
+```swift
+let accepting  = (flags & 0x01) != 0
+let hasRadar   = (flags & 0x02) != 0
+let hasWarnings = (flags & 0x04) != 0
+let hasForecasts = (flags & 0x08) != 0
+let hasFire    = (flags & 0x10) != 0
+let hasNowcast = (flags & 0x20) != 0
+let hasQPF     = (flags & 0x40) != 0
+```
+
+### Step 3: Present bot picker
+
+Show the user a list:
+```
+Austin WX Bot — 3 warnings — radar, forecasts, fire weather
+  [Join #aus-meshwx-v4]
+
+Dallas WX Bot — 0 warnings — radar, forecasts
+  [Join #dfw-meshwx-v4]
+```
+
+### Step 4: Join the data channel
+
+User picks a bot → client joins `#<channel_name>` from the beacon → leave `#meshwx-discover` to free the slot.
+
+---
+
+## 7. Location encoding reference
 
 All location refs are type-tagged (first byte = type):
 
@@ -262,20 +322,21 @@ All location refs are type-tagged (first byte = type):
 
 ---
 
-## 7. Recommended client implementation order
+## 8. Recommended client implementation order
 
-1. **v4 header parsing + auto-detect** — unwrap to v3 and use existing decoders. This gives you sequence numbers and all existing products immediately.
-2. **Sequence number tracking** — gap detection, link quality display.
-3. **New message types** (0x38, 0x3A, 0x3C, 0x12) — add decoders and UI.
-4. **FEC collection** — buffer FEC group units by (msg_type, group_id). Display base layer immediately.
-5. **XOR recovery** — when group is complete minus 1, recover the missing unit.
-6. **Radar quadrant rendering** — composite 4 quadrants into 64x64 display.
+1. **Discovery** — join `#meshwx-discover`, send ping, collect beacons, join a bot's data channel.
+2. **v4 header parsing + auto-detect** — unwrap to v3 and use existing decoders. This gives you sequence numbers and all existing products immediately.
+3. **Sequence number tracking** — gap detection, link quality display.
+4. **New message types** (0x38, 0x3A, 0x3C, 0x12) — add decoders and UI.
+5. **FEC collection** — buffer FEC group units by (msg_type, group_id). Display base layer immediately.
+6. **XOR recovery** — when group is complete minus 1, recover the missing unit.
+7. **Radar quadrant rendering** — composite 4 quadrants into 64x64 display.
 
-Steps 1-3 are independent. Steps 4-6 build on each other.
+Steps 1-4 are independent. Steps 5-7 build on each other.
 
 ---
 
-## 8. Quick reference: complete message flow
+## 9. Quick reference: complete message flow
 
 ```
 Client receives COBS-decoded bytes:

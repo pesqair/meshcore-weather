@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Meshcore Weather Portal</title>
+  <link rel="stylesheet" href="/static/portal.css">
+  <link rel="stylesheet" href="/static/vendor/maplibre/maplibre-gl.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-inner">
+      <a href="#overview" class="brand" onclick="Portal.router.navigate('overview')">
+        Meshcore Weather
+        <span class="brand-badge">GOES-E</span>
+      </a>
+      <nav class="nav" id="main-nav">
+        <a href="#overview" data-section="overview" class="active">Overview</a>
+        <a href="#broadcast" data-section="broadcast">Broadcast</a>
+        <a href="#map" data-section="map">Weather Map</a>
+        <a href="#system" data-section="system">System</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="main" id="app">
+
+    <!-- ============ SECTION 1: OVERVIEW ============ -->
+    <section id="section-overview" class="section active">
+      <h1 class="page-title">Overview</h1>
+      <p class="page-subtitle">Coverage area, data, mesh activity, and bot status.</p>
+
+      <div class="grid grid-5 mb-4" id="overview-stats"></div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Current Coverage</div>
+            <div class="card-subtitle" id="overview-coverage-text">Loading&hellip;</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Bot Status</div>
+            <div class="card-subtitle" id="overview-status-time"></div>
+          </div>
+          <button class="btn" onclick="Portal.overview.refresh()">Refresh</button>
+        </div>
+        <div id="overview-status-grid" class="grid grid-2"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div><div class="card-title">Quick Actions</div></div>
+        </div>
+        <div class="flex gap-2">
+          <button class="btn btn-primary" onclick="Portal.actions.broadcast(this)">Broadcast Now</button>
+          <a href="#map" class="btn">View Weather Map</a>
+          <a href="#broadcast" class="btn">Manage Schedule</a>
+        </div>
+        <div id="overview-action-result" class="text-small mt-4"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Broadcast Stats</div>
+            <div class="card-subtitle">Messages and bytes sent over time</div>
+          </div>
+        </div>
+        <div id="overview-stats-windows" class="grid grid-5 mb-4"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Activity Log</div>
+            <div class="card-subtitle" id="activity-log-count"></div>
+          </div>
+          <span class="dot dot-green" id="activity-live-dot" style="margin-right:4px"></span>
+          <button class="btn" onclick="Portal.overview.loadActivity()">Reconnect</button>
+        </div>
+        <div style="max-height: 400px; overflow: auto;">
+          <table class="table" id="activity-table">
+            <thead>
+              <tr><th>Time</th><th></th><th>Type</th><th>Summary</th></tr>
+            </thead>
+            <tbody id="activity-body">
+              <tr><td colspan="4" class="text-muted">Loading&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SECTION 2: BROADCAST CONTROL ============ -->
+    <section id="section-broadcast" class="section">
+      <h1 class="page-title">Broadcast Control</h1>
+      <p class="page-subtitle">Scheduled broadcast jobs and EMWIN product store.</p>
+
+      <div class="sub-tabs mb-4" id="broadcast-tabs">
+        <button class="sub-tab active" data-tab="jobs" onclick="Portal.broadcast.switchTab('jobs')">Jobs</button>
+        <button class="sub-tab" data-tab="products" onclick="Portal.broadcast.switchTab('products')">Products</button>
+      </div>
+
+      <!-- Jobs sub-tab -->
+      <div id="broadcast-tab-jobs" class="sub-tab-content active">
+        <div class="flex gap-2 mb-4">
+          <button class="btn btn-primary" onclick="Portal.broadcast.openJobModal('create')">+ New broadcast job</button>
+          <button class="btn" onclick="Portal.broadcast.loadJobs()">Refresh</button>
+        </div>
+        <div class="card">
+          <table class="job-table">
+            <thead>
+              <tr>
+                <th>Name</th><th>Product</th><th>Location</th>
+                <th>Interval</th><th>Last Run</th><th>Next Run</th>
+                <th>Bytes</th><th>Enabled</th><th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="jobs-body">
+              <tr><td colspan="9" class="text-muted">Loading&hellip;</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Products sub-tab -->
+      <div id="broadcast-tab-products" class="sub-tab-content">
+        <div class="card">
+          <div class="grid grid-4 mb-4">
+            <div>
+              <label class="form-label">Type</label>
+              <select class="input" id="filter-type" onchange="Portal.products.load()">
+                <option value="">All types</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">Office</label>
+              <select class="input" id="filter-office" onchange="Portal.products.load()">
+                <option value="">All offices</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">State</label>
+              <select class="input" id="filter-state" onchange="Portal.products.load()">
+                <option value="">All states</option>
+              </select>
+            </div>
+            <div>
+              <label class="form-label">Search</label>
+              <input type="search" class="input" id="filter-q" placeholder="Text contains&hellip;" oninput="Portal.products.debouncedLoad()">
+            </div>
+          </div>
+          <table class="table">
+            <thead>
+              <tr><th>Type</th><th>Office</th><th>State</th><th>Time</th><th>Preview</th></tr>
+            </thead>
+            <tbody id="products-tbody"></tbody>
+          </table>
+          <div id="products-summary" class="text-small text-muted mt-4"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ SECTION 3: WEATHER MAP ============ -->
+    <section id="section-map" class="section section-map">
+      <div class="map-container">
+        <div id="map"></div>
+        <div class="map-legend" id="map-legend"></div>
+        <div class="map-status" id="map-status">Loading&hellip;</div>
+      </div>
+    </section>
+
+    <!-- ============ SECTION 4: SYSTEM ============ -->
+    <section id="section-system" class="section">
+      <h1 class="page-title">System</h1>
+      <p class="page-subtitle">Coverage configuration, bot connection, and developer tools.</p>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Coverage Configuration</div>
+            <div class="card-subtitle">Loaded from environment variables at startup (read-only)</div>
+          </div>
+        </div>
+        <div class="grid grid-3 mb-4">
+          <div>
+            <div class="form-label">Cities</div>
+            <div id="sys-cities" class="tag-list"></div>
+          </div>
+          <div>
+            <div class="form-label">States</div>
+            <div id="sys-states" class="tag-list"></div>
+          </div>
+          <div>
+            <div class="form-label">WFOs</div>
+            <div id="sys-wfos" class="tag-list"></div>
+          </div>
+        </div>
+        <div id="sys-coverage-summary" class="text-small text-muted"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Coverage Preview</div>
+            <div class="card-subtitle" id="sys-preview-summary">Loading&hellip;</div>
+          </div>
+        </div>
+        <div class="preview-map mb-4">
+          <div id="sys-preview-map"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Radar Settings</div>
+            <div class="card-subtitle">Default resolution for on-demand radar requests from clients</div>
+          </div>
+        </div>
+        <div class="grid grid-2 mb-4">
+          <div>
+            <label class="form-label">On-demand Radar Resolution</label>
+            <select class="input" id="sys-radar-grid" onchange="Portal.system.saveRadarGrid()">
+              <option value="32">32x32 (standard, ~42 km/cell)</option>
+              <option value="64">64x64 (high-res, ~21 km/cell)</option>
+            </select>
+            <span class="form-hint">When a client requests radar for a region, this resolution is used. Broadcast jobs have their own per-job setting.</span>
+          </div>
+          <div>
+            <div class="form-label">Status</div>
+            <div id="sys-radar-status" class="text-small text-muted"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Developer Tools</div>
+            <div class="card-subtitle">Test actions that trigger real broadcasts</div>
+          </div>
+        </div>
+        <div class="flex gap-2 mb-4">
+          <button class="btn btn-primary" onclick="Portal.actions.broadcast(this)">Broadcast Now</button>
+        </div>
+        <div class="divider"></div>
+        <div class="card-title mb-4" style="font-size: 14px;">Simulate V2 Data Request</div>
+        <div class="grid grid-3 mb-4">
+          <div>
+            <label class="form-label">Data Type</label>
+            <select class="input" id="v2-data-type">
+              <option value="wx">wx</option>
+              <option value="forecast">forecast</option>
+              <option value="metar">metar</option>
+            </select>
+          </div>
+          <div>
+            <label class="form-label">Location</label>
+            <input type="text" class="input" id="v2-location" placeholder="Austin TX">
+          </div>
+          <div style="display: flex; align-items: end;">
+            <button class="btn" onclick="Portal.actions.v2Request(this)">Send</button>
+          </div>
+        </div>
+        <div id="sys-action-result" class="text-small mt-4"></div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Shared modal -->
+  <div class="modal" id="modal-overlay" style="display: none;" onclick="if(event.target===this)Portal.ui.closeModal()">
+    <div class="modal-content" id="modal-content"></div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast" style="display: none;"></div>
+
+  <!-- Boot data from server -->
+  <script>window.__BOOT__ = {{ boot_json | safe }};</script>
+  <script src="/static/vendor/maplibre/maplibre-gl.js"></script>
+  <script src="/static/portal.js"></script>
+</body>
+</html>

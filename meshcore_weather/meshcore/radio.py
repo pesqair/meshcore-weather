@@ -249,8 +249,8 @@ class MeshcoreRadio:
                 if result.type == EventType.ERROR:
                     logger.warning("Binary send failed on data ch %d: %s", self._data_channel_idx, result.payload)
                 else:
-                    logger.debug("Binary sent on ch %d: %d bytes",
-                                 self._data_channel_idx, len(payload))
+                    logger.info("Sent ch%d: %dB",
+                                self._data_channel_idx, len(payload))
             except Exception:
                 logger.exception("Failed to send binary on data channel")
 

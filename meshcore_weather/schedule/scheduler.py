@@ -301,6 +301,7 @@ class Scheduler:
             grid_size = 32
             if ":" in loc_id:
                 parts = loc_id.split(":", 1)
+                loc_id = parts[0].strip()
                 try:
                     grid_size = int(parts[1].strip())
                 except ValueError:
@@ -309,16 +310,25 @@ class Scheduler:
             if grid_size == 64:
                 from meshcore_weather.protocol.radar import build_fec_radar_messages
                 img, ts_min = ctx.latest_radar
-                region_ids = (
-                    ctx.coverage.region_ids
-                    if not ctx.coverage.is_empty()
-                    else None
-                )
+                # Use the specific region from the job, not all coverage regions
+                if job.location_type == "region" and loc_id:
+                    try:
+                        region_ids = {int(loc_id, 0)}
+                    except (ValueError, TypeError):
+                        region_ids = None
+                else:
+                    region_ids = (
+                        ctx.coverage.region_ids
+                        if not ctx.coverage.is_empty()
+                        else None
+                    )
                 msgs = build_fec_radar_messages(
                     img, ts_min, self._v4_seq,
                     region_ids=region_ids,
                 )
                 if msgs:
+                    logger.info("FEC radar: %d messages for region(s) %s",
+                                len(msgs), region_ids)
                     return msgs
 
         if job.product == "afd":

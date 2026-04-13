@@ -287,14 +287,45 @@ If multiple warnings affect the zone, their descriptions are separated by `---`.
 2. User taps warning → send `0x02` data request with `data_type=0x08`, `location=LOC_ZONE` for one of the warning's zone codes
 3. Receive 0x40 text chunks → display in warning detail view
 
-**Zone polygon rendering:** Zone-based warnings (0x21) use NWS zone codes like `TXZ192`. The iOS app must bundle the official NWS zone boundary shapefiles to draw these on the map. Download from:
+**Zone polygon rendering:** Zone-based warnings (0x21) use NWS zone codes like `TXZ192`. The iOS app must bundle `zones.geojson` (from `meshcore_weather/client_data/zones.geojson` in the repo) to draw zone boundaries on the map.
 
-- Public forecast zones: `https://www.weather.gov/source/gis/Shapefiles/WSOM/z_16ap26.zip`
-- Fire weather zones: `https://www.weather.gov/source/gis/Shapefiles/WSOM/fz16ap26.zip`
-- Marine zones: `https://www.weather.gov/source/gis/Shapefiles/WSOM/mz16ap26.zip`
-- Offshore zones: `https://www.weather.gov/source/gis/Shapefiles/WSOM/oz16ap26.zip`
+The file is a standard GeoJSON FeatureCollection (~9.5 MB raw, ~2.4 MB gzipped):
 
-Convert to GeoJSON at build time and bundle in the app. Match zone codes via the `STATE` + `ZONE` columns (e.g. `TX` + `192` → `TXZ192`). These files update ~2x/year.
+```json
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "zone": "TXZ192" },
+      "geometry": { "type": "Polygon", "coordinates": [...] }
+    },
+    ...
+  ]
+}
+```
+
+- **5,419 zones** — public forecast, fire weather, marine, and offshore
+- Keyed by `properties.zone` (e.g. `TXZ192`, `GMZ335`, `ANZ150`)
+- Coordinates are `[lon, lat]` (standard GeoJSON order)
+- Simplified to ~1km tolerance — good enough for zone-level rendering
+- Load at app startup, build a dictionary keyed by zone code
+
+**Rendering a 0x21 warning:**
+```swift
+// 1. Parse zone codes from the warning message
+let zones = ["TXZ001", "TXZ002", "TXZ003"]
+
+// 2. Look up each zone in the bundled GeoJSON
+for code in zones {
+    if let feature = zoneIndex[code] {
+        // 3. Draw the polygon on the map with warning-type color
+        drawPolygon(feature.geometry, color: warningColor(type, severity))
+    }
+}
+```
+
+**Source data:** The GeoJSON was built from official NWS shapefiles (public zones `z_16ap26`, fire `fz16ap26`, marine `mz16ap26`, offshore `oz16ap26`). NWS updates these ~2x/year. Regenerate with `scripts/build_zone_polygons.py` when needed.
 
 **Fire warnings (0x7):** These are zone-based (0x21), not polygon-based. The zone codes in the message ARE the location. Fire weather zones cover large areas (counties/regions), unlike storm-scale tornado polygons.
 

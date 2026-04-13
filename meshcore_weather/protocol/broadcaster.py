@@ -22,6 +22,7 @@ import logging
 import time
 from pathlib import Path
 
+from meshcore_weather.activity import EventDir, activity_log
 from meshcore_weather.config import settings
 from meshcore_weather.geodata import resolver
 from meshcore_weather.meshcore.radio import MeshcoreRadio
@@ -133,8 +134,16 @@ class MeshWXBroadcaster:
         """
         now = time.time()
         last = self._last_refresh.get(region_id, 0)
-        if now - last < settings.meshwx_refresh_cooldown:
-            logger.debug("Refresh for region 0x%X throttled (cooldown)", region_id)
+        cooldown = settings.meshwx_refresh_cooldown
+        if now - last < cooldown:
+            remaining = int(cooldown - (now - last))
+            logger.info(
+                "Refresh for region 0x%X throttled — cooldown %ds, retry in %ds",
+                region_id, cooldown, remaining,
+            )
+            activity_log.record(EventDir.IN, "throttled",
+                f"Region 0x{region_id:X} refresh throttled ({remaining}s remaining)",
+                {"region_id": region_id, "cooldown": cooldown, "remaining": remaining})
             return
         self._last_refresh[region_id] = now
 
@@ -143,13 +152,28 @@ class MeshWXBroadcaster:
         if request_type in (1, 3):
             await self._scheduler._refresh_radar()
             if self._scheduler._latest_radar is not None:
-                from meshcore_weather.protocol.meshwx import pack_radar_grid, REGIONS
+                from meshcore_weather.protocol.meshwx import pack_radar_compressed, REGIONS
                 img_data, ts_min = self._scheduler._latest_radar
-                grid = extract_region_grid(img_data, region_id)
+                # Use the broadcast config's grid size (portal-editable),
+                # falling back to the env-var default.
+                cfg = self._scheduler.current_config()
+                grid_size = getattr(cfg, "radar_grid_size", None) or settings.meshwx_radar_grid_size
+                if grid_size not in (16, 32, 64):
+                    grid_size = 32
+                grid = extract_region_grid(img_data, region_id, grid_size=grid_size)
                 if grid:
                     region = REGIONS[region_id]
-                    msg = pack_radar_grid(region_id, 0, ts_min, region["scale"], grid)
-                    await self.radio.send_binary_channel(cobs_encode(msg))
+                    msgs = pack_radar_compressed(
+                        region_id=region_id,
+                        timestamp_utc_min=ts_min,
+                        scale_km=region["scale"],
+                        grid=grid,
+                        grid_size=grid_size,
+                    )
+                    for i, msg in enumerate(msgs):
+                        await self.radio.send_binary_channel(cobs_encode(msg))
+                        if i + 1 < len(msgs):
+                            await asyncio.sleep(TX_SPACING)
 
         if request_type in (2, 3):
             # Broadcast all active warnings in the scheduler's coverage
@@ -162,6 +186,10 @@ class MeshWXBroadcaster:
                 if i + 1 < len(msgs):
                     await asyncio.sleep(TX_SPACING)
 
+        req_label = {1: "radar", 2: "warnings", 3: "radar+warnings"}.get(request_type, str(request_type))
+        activity_log.record(EventDir.IN, "v1_refresh",
+            f"Region 0x{region_id:X} refresh ({req_label})",
+            {"region_id": region_id, "request_type": request_type})
         logger.info("MeshWX refresh for region 0x%X (type=%d)", region_id, request_type)
 
     # Response cache for reliability over multi-hop mesh
@@ -195,6 +223,13 @@ class MeshWXBroadcaster:
         loc_key = self._location_key(loc)
         cache_key = f"{data_type}:{loc_key}"
         now = time.time()
+
+        _dt_names = {0: "wx", 1: "forecast", 2: "outlook", 3: "storm_reports",
+                     4: "rain_obs", 5: "metar", 6: "taf", 7: "warnings_near"}
+        dt_name = _dt_names.get(data_type, f"0x{data_type:02x}")
+        activity_log.record(EventDir.IN, "v2_request",
+            f"Data request: {dt_name} for {loc_key}",
+            {"data_type": data_type, "data_type_name": dt_name, "location": loc_key})
 
         if not hasattr(self, "_v2_cache"):
             self._v2_cache: dict[str, tuple[float, bytes]] = {}
@@ -276,6 +311,10 @@ class MeshWXBroadcaster:
             "Sent v2 response type=0x%02x for %s (%d bytes)",
             msg[0], cache_key, len(msg),
         )
+        activity_log.record(EventDir.OUT, "v2_response",
+            f"Response: {dt_name} for {loc_key} ({len(msg)}B)",
+            {"data_type_name": dt_name, "location": loc_key, "bytes": len(msg), "msg_type": f"0x{msg[0]:02x}"})
+        activity_log.record_send(1, len(msg))
         await self._transmit_response(msg)
 
     async def _emit_not_available(

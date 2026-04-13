@@ -249,8 +249,8 @@ class MeshcoreRadio:
                 if result.type == EventType.ERROR:
                     logger.warning("Binary send failed on data ch %d: %s", self._data_channel_idx, result.payload)
                 else:
-                    logger.info("Binary sent on ch %d: %d bytes (type 0x%02x)",
-                                self._data_channel_idx, len(payload), payload[0] if payload else 0)
+                    logger.debug("Binary sent on ch %d: %d bytes",
+                                 self._data_channel_idx, len(payload))
             except Exception:
                 logger.exception("Failed to send binary on data channel")
 
@@ -272,8 +272,8 @@ class MeshcoreRadio:
                 if result.type == EventType.ERROR:
                     logger.warning("Beacon send failed on ch %d", self._discover_channel_idx)
                 else:
-                    logger.info("Beacon sent on discovery ch %d (%d bytes)",
-                                self._discover_channel_idx, len(payload))
+                    logger.debug("Beacon sent on discovery ch %d (%d bytes)",
+                                 self._discover_channel_idx, len(payload))
             except Exception:
                 logger.exception("Failed to send beacon")
 

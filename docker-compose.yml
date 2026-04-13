@@ -5,6 +5,7 @@ services:
     restart: unless-stopped
     volumes:
       - weather-data:/app/data
+      - ./.env:/app/.env
     ports:
       - "8080:8080"
     env_file:

@@ -498,4 +498,11 @@ class Scheduler:
                 logger.exception("run_job_now: send failed for %s", job_id)
         self._last_bytes[job.id] = sent_bytes
         self._total_bytes[job.id] = self._total_bytes.get(job.id, 0) + sent_bytes
+        self._last_msg_count[job.id] = len(v4_msgs)
+        activity_log.record(EventDir.OUT, "broadcast",
+            f"Job {job.id}: {len(v4_msgs)} msg(s), {sent_bytes}B ({job.product})",
+            {"job_id": job.id, "product": job.product, "messages": len(v4_msgs), "bytes": sent_bytes})
+        activity_log.record_send(len(v4_msgs), sent_bytes)
+        logger.info("run_job_now: %s → %d msg(s), %d bytes (%s)",
+                     job.id, len(v4_msgs), sent_bytes, job.product)
         return len(v4_msgs)

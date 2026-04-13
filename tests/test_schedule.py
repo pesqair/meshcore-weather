@@ -464,6 +464,14 @@ class TestBroadcasterNotAvailable:
         bc = MeshWXBroadcaster(store, radio)
         return bc, sent
 
+    @staticmethod
+    def _unwrap_v4(raw: bytes) -> bytes:
+        """Strip v4 frame header if present."""
+        if raw and raw[0] == 0x04:
+            from meshcore_weather.protocol.meshwx import v4_unwrap
+            raw, _, _ = v4_unwrap(raw)
+        return raw
+
     @pytest.mark.asyncio
     async def test_no_data_emits_not_available(self):
         """Empty store + valid request → NOT_AVAILABLE with REASON_NO_DATA."""
@@ -487,7 +495,7 @@ class TestBroadcasterNotAvailable:
             bc_mod.MeshWXBroadcaster._V2_RESEND_GAP_SECONDS = original_gap
 
         assert len(sent) == 2  # double-transmit
-        raw = cobs_decode(sent[0])
+        raw = self._unwrap_v4(cobs_decode(sent[0]))
         assert raw[0] == MSG_NOT_AVAILABLE
         d = unpack_not_available(raw)
         assert d["data_type"] == DATA_METAR
@@ -527,7 +535,7 @@ class TestBroadcasterNotAvailable:
             bc_mod.MeshWXBroadcaster._V2_RESEND_GAP_SECONDS = original_gap
 
         assert len(sent) == 2
-        raw = cobs_decode(sent[0])
+        raw = self._unwrap_v4(cobs_decode(sent[0]))
         d = unpack_not_available(raw)
         assert d["reason"] == REASON_LOCATION_UNRESOLVABLE
         assert d["location"]["type"] == LOC_PFM_POINT
@@ -559,7 +567,7 @@ class TestBroadcasterNotAvailable:
             sent.clear()
             await bc.respond_to_data_request(req)
             assert len(sent) == 2
-            raw = cobs_decode(sent[0])
+            raw = self._unwrap_v4(cobs_decode(sent[0]))
             d = unpack_not_available(raw)
             assert d["reason"] == REASON_NO_DATA
         finally:

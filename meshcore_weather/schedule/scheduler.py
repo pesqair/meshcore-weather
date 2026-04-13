@@ -82,7 +82,8 @@ class Scheduler:
         self._config_lock = asyncio.Lock()
 
         self._http_client: httpx.AsyncClient | None = None
-        self._latest_radar: tuple[bytes, int] | None = None
+        self._latest_radar: tuple[bytes, int] | None = None  # IEM CONUS composite
+        self._latest_ridge: dict[str, tuple[bytes, int]] = {}  # RIDGE images by source key
 
         # Warning change tracking — persists across ticks so the delta
         # builder can compare current vs last-broadcast warning sets.
@@ -226,6 +227,7 @@ class Scheduler:
             coverage=self._coverage,
             pfm_points=self._pfm_points,
             latest_radar=self._latest_radar,
+            latest_ridge=self._latest_ridge,
             last_broadcast_warnings=self._warning_tracking,
         )
 
@@ -356,12 +358,34 @@ class Scheduler:
         return [v4_wrap(m, self._v4_seq.next()) for m in v3_msgs]
 
     async def _refresh_radar(self) -> None:
-        """Fetch the latest radar composite if we don't have one or it's stale."""
+        """Fetch the latest radar composites (IEM + RIDGE) if stale."""
         if self._http_client is None:
             return
+        # IEM CONUS composite (high-res, data-only, CONUS regions 0x0-0x6)
         result = await fetch_radar_composite(self._http_client)
         if result:
             self._latest_radar = result
+
+        # RIDGE images for non-CONUS regions (PR, Hawaii, Alaska, Guam)
+        # and as a fallback/alternative for CONUS regions
+        from meshcore_weather.protocol.ridge import (
+            REGION_TO_RIDGE, fetch_ridge_image,
+        )
+        needed_sources = set()
+        region_ids = (
+            self._coverage.region_ids
+            if not self._coverage.is_empty()
+            else set(REGION_TO_RIDGE.keys())
+        )
+        for rid in region_ids:
+            src = REGION_TO_RIDGE.get(rid)
+            if src and src != "conus":  # always fetch non-CONUS RIDGE
+                needed_sources.add(src)
+
+        for src_key in needed_sources:
+            result = await fetch_ridge_image(self._http_client, src_key)
+            if result:
+                self._latest_ridge[src_key] = result
 
     # -- Discovery ping/response -----------------------------------------------
 
@@ -474,6 +498,7 @@ class Scheduler:
             coverage=self._coverage,
             pfm_points=self._pfm_points,
             latest_radar=self._latest_radar,
+            latest_ridge=self._latest_ridge,
             last_broadcast_warnings=self._warning_tracking,
         )
         msgs = self.executor.run_job(job, ctx)

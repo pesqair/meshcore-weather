@@ -327,8 +327,8 @@ class MeshcoreRadio:
                 logger.exception("Error in discovery handler")
             return
 
-        # Text command channel
-        if channel_idx != self._channel_idx:
+        # Text command channel or data channel (v4 clients send requests on data ch)
+        if channel_idx != self._channel_idx and channel_idx != self._data_channel_idx:
             return
 
         sender = "unknown"

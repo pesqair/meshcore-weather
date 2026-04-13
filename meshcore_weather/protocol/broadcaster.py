@@ -40,6 +40,7 @@ from meshcore_weather.protocol.encoders import (
     now_utc_minutes,
 )
 from meshcore_weather.protocol.meshwx import (
+    V4SequenceCounter,
     DATA_FORECAST,
     DATA_METAR,
     DATA_OUTLOOK,
@@ -369,15 +370,15 @@ class MeshWXBroadcaster:
         await self._transmit_response(msg)
 
     async def _transmit_response(self, msg: bytes) -> None:
-        """Send a v2 response on the data channel N times for reliability.
+        """Send a response on the data channel with v4 framing.
 
-        Flood-routed channel broadcasts can drop over multi-hop mesh
-        topologies. Sending the same message twice with a short gap
-        gives far-away clients a second chance to receive it. The gap
-        is there to let the first transmission fully propagate before
-        the second hits the channel.
+        Wraps in a v4 frame (same as scheduled broadcasts) so the client
+        sees a consistent format on the data channel. Sends N times for
+        reliability over multi-hop mesh.
         """
-        cobs_msg = cobs_encode(msg)
+        from meshcore_weather.protocol.meshwx import v4_wrap
+        v4_msg = v4_wrap(msg, self._scheduler._v4_seq.next())
+        cobs_msg = cobs_encode(v4_msg)
         for i in range(self._V2_RESEND_COUNT):
             try:
                 await self.radio.send_binary_channel(cobs_msg)

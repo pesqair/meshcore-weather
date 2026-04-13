@@ -80,6 +80,8 @@ MSG_DAILY_CLIMATE = 0x3A # v4: daily climate summary (RTP)
 MSG_NOWCAST = 0x3C       # v4: short-term forecast (NOW)
 MSG_QPF_GRID = 0x12      # v4: QPF precipitation grid (same encoding as 0x11)
 MSG_TEXT_CHUNK = 0x40    # v2: compressed text fallback
+MSG_BEACON = 0xF0        # v4: discovery beacon (bot → client response)
+MSG_DISCOVER_PING = 0xF1 # v4: discovery ping (client → all bots)
 
 # -- v4 frame format --
 V4_VERSION = 0x04  # Protocol version byte (first byte of every v4 frame)
@@ -1590,6 +1592,91 @@ def unpack_taf(data: bytes) -> dict:
         "ceiling_ft": ceiling_100ft * 100,
         "sky_code": sky_code,
         "weather_flags": weather_flags,
+    }
+
+
+# -- Discovery Beacon (0xF0) — bot announces itself on #meshwx-discover ------
+
+# Beacon flag bits
+BEACON_ACCEPTING_REQUESTS = 0x01
+BEACON_HAS_RADAR = 0x02
+BEACON_HAS_WARNINGS = 0x04
+BEACON_HAS_FORECASTS = 0x08
+BEACON_HAS_FIRE_WEATHER = 0x10
+BEACON_HAS_NOWCAST = 0x20
+BEACON_HAS_QPF = 0x40
+
+
+def pack_beacon(
+    bot_id: int,
+    beacon_flags: int,
+    lat: float,
+    lon: float,
+    radius_km: int,
+    active_warnings: int,
+    channel_name: str,
+) -> bytes:
+    """Pack a discovery beacon message.
+
+    bot_id: uint24 unique per deployment (e.g. hash of pubkey)
+    beacon_flags: capability bits (see BEACON_* constants)
+    lat/lon: coverage center
+    radius_km: coverage radius
+    active_warnings: count of active warnings
+    channel_name: deployment channel name (e.g. "aus-meshwx-v4")
+    """
+    msg = bytearray()
+    msg.append(MSG_BEACON)
+    msg.append(V4_VERSION)  # protocol version
+    # bot_id uint24 BE
+    msg.append((bot_id >> 16) & 0xFF)
+    msg.append((bot_id >> 8) & 0xFF)
+    msg.append(bot_id & 0xFF)
+    msg.append(beacon_flags & 0xFF)
+    # coverage center: int16 lat*100, int16 lon*100
+    lat_i = max(-32768, min(32767, int(round(lat * 100))))
+    lon_i = max(-32768, min(32767, int(round(lon * 100))))
+    msg.extend(struct.pack(">hh", lat_i, lon_i))
+    msg.append(min(255, max(0, radius_km)))
+    msg.append(min(255, max(0, active_warnings)))
+    # channel name
+    name_bytes = channel_name.encode("utf-8")[:32]
+    msg.append(len(name_bytes))
+    msg.extend(name_bytes)
+    return bytes(msg)
+
+
+def unpack_beacon(data: bytes) -> dict:
+    """Unpack a discovery beacon message."""
+    if len(data) < 12 or data[0] != MSG_BEACON:
+        raise ValueError("Invalid beacon message")
+    protocol_version = data[1]
+    bot_id = (data[2] << 16) | (data[3] << 8) | data[4]
+    flags = data[5]
+    lat = struct.unpack_from(">h", data, 6)[0] / 100.0
+    lon = struct.unpack_from(">h", data, 8)[0] / 100.0
+    radius_km = data[10]
+    active_warnings = data[11]
+    name_len = data[12] if len(data) > 12 else 0
+    channel_name = data[13:13 + name_len].decode("utf-8", errors="replace") if name_len else ""
+
+    return {
+        "type": MSG_BEACON,
+        "protocol_version": protocol_version,
+        "bot_id": bot_id,
+        "beacon_flags": flags,
+        "accepting_requests": bool(flags & BEACON_ACCEPTING_REQUESTS),
+        "has_radar": bool(flags & BEACON_HAS_RADAR),
+        "has_warnings": bool(flags & BEACON_HAS_WARNINGS),
+        "has_forecasts": bool(flags & BEACON_HAS_FORECASTS),
+        "has_fire_weather": bool(flags & BEACON_HAS_FIRE_WEATHER),
+        "has_nowcast": bool(flags & BEACON_HAS_NOWCAST),
+        "has_qpf": bool(flags & BEACON_HAS_QPF),
+        "lat": lat,
+        "lon": lon,
+        "radius_km": radius_km,
+        "active_warnings": active_warnings,
+        "channel_name": channel_name,
     }
 
 

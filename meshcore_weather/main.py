@@ -99,6 +99,10 @@ class WeatherBot:
             self._broadcaster = MeshWXBroadcaster(self.store, self.radio)
             await self._broadcaster.start()
 
+            # Register discovery ping handler — bots respond to pings on #meshwx-discover
+            if self.radio.discover_channel_idx is not None:
+                self.radio.on_discover_ping(self._broadcaster.scheduler.respond_to_discovery_ping)
+
         # Start local operator web portal if enabled
         if settings.portal_enabled:
             try:

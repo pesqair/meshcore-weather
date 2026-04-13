@@ -29,8 +29,10 @@ class Settings(BaseSettings):
     # Data storage
     data_dir: Path = Path("data")
 
-    # MeshWX binary data channel — all v4-framed broadcasts go here (empty = disabled)
+    # MeshWX data channel — all v4-framed broadcasts go here (empty = disabled)
     meshwx_channel: str = ""
+    # Discovery channel — beacon broadcast for client auto-discovery
+    meshwx_discover_channel: str = "#meshwx-discover"
     meshwx_broadcast_interval: int = 3600  # seconds between broadcasts
     meshwx_refresh_cooldown: int = 300    # min seconds between refresh per region
     meshwx_radar_grid_size: int = 32      # default grid size for on-demand radar (16, 32, or 64)

@@ -1016,13 +1016,14 @@ var Portal = {
       var cfg = boot.channel_config || {};
       document.getElementById("sys-ch-text").value = cfg.text_channel || "";
       document.getElementById("sys-ch-data").value = cfg.data_channel || "";
-      // Show active channel indices
+      document.getElementById("sys-ch-discover").value = cfg.discover_channel || "";
       var parts = [];
       if (boot.channel_idx != null) parts.push("text: ch" + boot.channel_idx);
       if (boot.data_channel != null) parts.push("data: ch" + boot.data_channel);
+      if (boot.discover_channel != null) parts.push("discover: ch" + boot.discover_channel);
       document.getElementById("sys-ch-status").textContent = parts.length
         ? "Active: " + parts.join(", ")
-        : "No data channel active";
+        : "No channels active";
     },
 
     saveChannels: function (btn) {
@@ -1032,6 +1033,7 @@ var Portal = {
       var body = {
         text_channel: document.getElementById("sys-ch-text").value.trim(),
         data_channel: document.getElementById("sys-ch-data").value.trim(),
+        discover_channel: document.getElementById("sys-ch-discover").value.trim(),
       };
       fetch("/api/settings/channels", {
         method: "POST",

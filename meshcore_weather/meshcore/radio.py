@@ -28,7 +28,9 @@ class MeshcoreRadio:
         self._running = False
         self._channel_idx: int | None = None
         self._data_channel_idx: int | None = None
+        self._discover_channel_idx: int | None = None
         self._channel_handler: Callable | None = None
+        self._discover_handler: Callable | None = None
         self._dm_handler: Callable | None = None
         self._advert_handler: Callable | None = None
         self._advert_task: asyncio.Task | None = None
@@ -51,6 +53,10 @@ class MeshcoreRadio:
     def on_advert(self, handler: Callable) -> None:
         """Register handler: async def handler(contact_name, pubkey_prefix)"""
         self._advert_handler = handler
+
+    def on_discover_ping(self, handler: Callable) -> None:
+        """Register handler: async def handler() — called when a ping arrives on discovery channel"""
+        self._discover_handler = handler
 
     def on_dm(self, handler: Callable) -> None:
         """Register handler: async def handler(pubkey_prefix, sender_name, text)"""
@@ -89,6 +95,20 @@ class MeshcoreRadio:
                 else:
                     logger.warning("Could not create data channel '%s' — no free slots",
                                    settings.meshwx_channel)
+
+        # Resolve discovery channel for beacon broadcasts
+        if settings.meshwx_discover_channel:
+            try:
+                self._discover_channel_idx = await self._resolve_channel(settings.meshwx_discover_channel)
+                logger.info("Discovery channel %d (%s)", self._discover_channel_idx, settings.meshwx_discover_channel)
+            except ValueError:
+                created = await self._create_channel(settings.meshwx_discover_channel)
+                if created is not None:
+                    self._discover_channel_idx = created
+                    logger.info("Created discovery channel %d (%s)", created, settings.meshwx_discover_channel)
+                else:
+                    logger.warning("Could not create discovery channel '%s' — no free slots",
+                                   settings.meshwx_discover_channel)
 
         # Subscribe to channel messages, DMs, and new adverts
         self._mc.subscribe(EventType.CHANNEL_MSG_RECV, self._on_channel_msg)
@@ -234,6 +254,29 @@ class MeshcoreRadio:
             except Exception:
                 logger.exception("Failed to send binary on data channel")
 
+    async def send_beacon(self, payload: bytes) -> None:
+        """Send a beacon on the discovery channel."""
+        if not self._mc or self._discover_channel_idx is None:
+            return
+        async with self.send_lock:
+            import time as _time
+            ts_bytes = int(_time.time()).to_bytes(4, "little")
+            data = (
+                b"\x03\x00"
+                + self._discover_channel_idx.to_bytes(1, "little")
+                + ts_bytes
+                + payload
+            )
+            try:
+                result = await self._mc.commands.send(data, [EventType.OK, EventType.ERROR])
+                if result.type == EventType.ERROR:
+                    logger.warning("Beacon send failed on ch %d", self._discover_channel_idx)
+                else:
+                    logger.info("Beacon sent on discovery ch %d (%d bytes)",
+                                self._discover_channel_idx, len(payload))
+            except Exception:
+                logger.exception("Failed to send beacon")
+
     async def send_dm(self, pubkey_prefix: str, text: str) -> bool:
         """Send a direct message to a contact by their public key prefix."""
         if not self._mc:
@@ -271,8 +314,21 @@ class MeshcoreRadio:
         channel_idx = payload.get("channel_idx", 0)
         text = payload.get("text", "")
 
-        # Only process messages on our channel
-        if channel_idx != self._channel_idx or channel_idx == 0:
+        if channel_idx == 0:
+            return
+
+        # Discovery channel — check for ping
+        if channel_idx == self._discover_channel_idx and self._discover_handler:
+            # Any message on the discovery channel triggers a beacon response
+            logger.info("Discovery ping received on ch %d", channel_idx)
+            try:
+                await self._discover_handler()
+            except Exception:
+                logger.exception("Error in discovery handler")
+            return
+
+        # Text command channel
+        if channel_idx != self._channel_idx:
             return
 
         sender = "unknown"
@@ -366,3 +422,7 @@ class MeshcoreRadio:
     @property
     def data_channel_idx(self) -> int | None:
         return self._data_channel_idx
+
+    @property
+    def discover_channel_idx(self) -> int | None:
+        return self._discover_channel_idx

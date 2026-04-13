@@ -353,6 +353,78 @@ class Scheduler:
         if result:
             self._latest_radar = result
 
+    # -- Discovery ping/response -----------------------------------------------
+
+    async def respond_to_discovery_ping(self) -> None:
+        """Respond to a client ping on #meshwx-discover with our beacon.
+
+        Called by the bot's channel message handler when it sees a ping
+        on the discovery channel. All bots on the channel respond, so
+        the client collects responses and presents a list.
+
+        Random delay (1-5s) so multiple bots don't collide on air.
+        """
+        import random
+        await asyncio.sleep(random.uniform(1.0, 5.0))
+
+        from meshcore_weather.protocol.meshwx import (
+            BEACON_ACCEPTING_REQUESTS, BEACON_HAS_FORECASTS,
+            BEACON_HAS_FIRE_WEATHER, BEACON_HAS_NOWCAST,
+            BEACON_HAS_QPF, BEACON_HAS_RADAR, BEACON_HAS_WARNINGS,
+            cobs_encode, pack_beacon,
+        )
+
+        # Build beacon flags from what products the bot actually has
+        flags = BEACON_ACCEPTING_REQUESTS | BEACON_HAS_FORECASTS | BEACON_HAS_WARNINGS
+        if self._latest_radar is not None:
+            flags |= BEACON_HAS_RADAR
+        # Check if we have FWF/NOW/QPF products in the store
+        for prod in self.store._products.values():
+            if prod.product_type == "FWF":
+                flags |= BEACON_HAS_FIRE_WEATHER
+            elif prod.product_type == "NOW":
+                flags |= BEACON_HAS_NOWCAST
+
+        # Coverage center and radius
+        lat, lon, radius_km = 0.0, 0.0, 0
+        if not self._coverage.is_empty():
+            bbox = self._coverage.bbox
+            if bbox:
+                lat = (bbox[0] + bbox[1]) / 2  # (south + north) / 2
+                lon = (bbox[2] + bbox[3]) / 2  # (west + east) / 2
+                # Rough radius from bbox
+                import math
+                dlat = (bbox[1] - bbox[0]) * 111 / 2
+                dlon = (bbox[3] - bbox[2]) * 111 * math.cos(math.radians(lat)) / 2
+                radius_km = int(max(dlat, dlon))
+
+        # Active warnings count
+        from meshcore_weather.protocol.warnings import extract_active_warnings
+        warnings = extract_active_warnings(self.store, self._coverage)
+        warning_count = len(warnings) if warnings else 0
+
+        # Bot ID from radio (hash of node info)
+        bot_id = 0
+        if self.radio._mc and self.radio._mc.self_info:
+            name = self.radio._mc.self_info.get("adv_name", "")
+            bot_id = hash(name) & 0xFFFFFF
+
+        # Channel name (the data channel clients should join)
+        channel_name = settings.meshwx_channel.lstrip("#") if settings.meshwx_channel else ""
+
+        beacon = pack_beacon(
+            bot_id=bot_id,
+            beacon_flags=flags,
+            lat=lat, lon=lon,
+            radius_km=min(255, radius_km),
+            active_warnings=warning_count,
+            channel_name=channel_name,
+        )
+        await self.radio.send_beacon(cobs_encode(beacon))
+        activity_log.record(EventDir.OUT, "beacon",
+            f"Beacon: {len(beacon)}B, {warning_count} warnings, radius {radius_km}km",
+            {"bytes": len(beacon), "warnings": warning_count})
+
     # -- Stats (used by the portal /schedule page) ----------------------------
 
     def job_status(self, job_id: str) -> dict:

@@ -266,16 +266,26 @@ if onset == 0 || now >= onset {
 
 **Severity nibbles:** 0x1=advisory, 0x2=watch, 0x3=warning, 0x4=emergency
 
-**Warning descriptions:** Each warning message (0x20/0x21) may be followed by one or more 0x40 text chunks containing a detailed description. These include structured data like:
+**Warning descriptions (on-demand, not broadcast):**
+
+Broadcasts only send the compact warning (headline + zones + timing). Descriptions are NOT pushed — the client requests them when the user taps a warning. This keeps broadcast airtime low (5 warnings = 5 messages, not 22).
+
+To get the full detail, send a v2 data request (0x02) with `data_type = 0x08` (WARNING_DETAIL) and a zone location. The bot responds with 0x40 text chunks containing:
 
 ```
+RED FLAG WARNING til 8 PM CDT eve
 Wind: Southwest at 20 to 30 mph with gusts to 40 mph.
 Humidity: As low as 12 percent.
 Fuels: Dry.
 Impacts: Any fires that develop can spread rapidly.
 ```
 
-The client should match description text chunks to their preceding warning by arrival order. Display the description in a detail/expanded view when the user taps a warning.
+If multiple warnings affect the zone, their descriptions are separated by `---`.
+
+**Client flow:**
+1. Receive 0x20/0x21 warning in broadcast → show on map with headline
+2. User taps warning → send `0x02` data request with `data_type=0x08`, `location=LOC_ZONE` for one of the warning's zone codes
+3. Receive 0x40 text chunks → display in warning detail view
 
 **Fire warnings (0x7):** These are zone-based (0x21), not polygon-based. The zone codes in the message ARE the location — the client renders them using its preloaded zone polygon geometries. Fire weather zones cover large areas (counties/regions), unlike storm-scale tornado polygons.
 

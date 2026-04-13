@@ -362,9 +362,14 @@ class Scheduler:
         if self._http_client is None:
             return
         # IEM CONUS composite (high-res, data-only, CONUS regions 0x0-0x6)
+        # Only update if the product timestamp changed (avoids re-broadcasting
+        # the same image with a different timestamp)
         result = await fetch_radar_composite(self._http_client)
         if result:
-            self._latest_radar = result
+            _, new_ts = result
+            old_ts = self._latest_radar[1] if self._latest_radar else None
+            if new_ts != old_ts:
+                self._latest_radar = result
 
         # RIDGE images for non-CONUS regions (PR, Hawaii, Alaska, Guam)
         # and as a fallback/alternative for CONUS regions

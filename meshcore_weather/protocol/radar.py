@@ -126,7 +126,8 @@ def extract_region_grid(
 async def fetch_radar_composite(client: httpx.AsyncClient) -> tuple[bytes, int] | None:
     """Fetch the latest IEM NEXRAD composite.
 
-    Returns (image_bytes, timestamp_utc_minutes) or None on failure.
+    Returns (image_bytes, timestamp_unix_min) or None on failure.
+    The timestamp comes from the product URL, not the download time.
     """
     now = datetime.now(timezone.utc)
     url = _iem_url(now)
@@ -142,16 +143,34 @@ async def fetch_radar_composite(client: httpx.AsyncClient) -> tuple[bytes, int] 
         try:
             resp = await client.get(url)
             resp.raise_for_status()
-            now = earlier
         except httpx.HTTPError as e:
             logger.warning("Failed to fetch radar composite: %s", e)
             return None
 
-    # Timestamp as absolute Unix minutes (minutes since epoch)
-    ts_unix_min = int(now.timestamp()) // 60
-    logger.info("Fetched radar composite (%d bytes, %02d:%02d UTC)",
-                len(resp.content), now.hour, now.minute)
+    # Extract the actual product timestamp from the URL we fetched
+    # URL ends with: n0q_YYYYMMDDHHmm.png
+    ts_unix_min = _extract_url_timestamp(url)
+    product_dt = datetime.fromtimestamp(ts_unix_min * 60, tz=timezone.utc)
+    logger.info("Fetched radar composite (%d bytes, %s UTC)",
+                len(resp.content), product_dt.strftime("%H:%M"))
     return resp.content, ts_unix_min
+
+
+def _extract_url_timestamp(url: str) -> int:
+    """Extract the product timestamp from an IEM composite URL.
+
+    URL pattern: .../n0q_YYYYMMDDHHmm.png
+    Returns Unix minutes.
+    """
+    import re
+    m = re.search(r"n0q_(\d{12})\.png", url)
+    if m:
+        dt = datetime.strptime(m.group(1), "%Y%m%d%H%M").replace(tzinfo=timezone.utc)
+        return int(dt.timestamp()) // 60
+    # Fallback: use current time rounded to 5 min
+    now = datetime.now(timezone.utc)
+    rounded = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+    return int(rounded.timestamp()) // 60
 
 
 def build_radar_messages(

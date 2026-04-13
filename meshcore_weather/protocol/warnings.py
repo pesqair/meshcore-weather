@@ -192,6 +192,74 @@ def _shorten_headline(h: str) -> str:
     return re.sub(r"  +", " ", h).strip()
 
 
+def _extract_headline_from_body(text: str) -> str:
+    """Extract a headline from the ...TEXT... block when pyIEM has no headline.
+
+    Looks for lines wrapped in triple-dots like:
+      ...RED FLAG WARNING REMAINS IN EFFECT FROM NOON TO 8 PM CDT...
+    """
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("...") and len(s) > 10:
+            # Strip the dots and return
+            clean = s.strip(".")
+            if clean and not any(x in clean.lower() for x in ("www.", "http")):
+                return clean
+    return ""
+
+
+def _extract_warning_description(text: str) -> str:
+    """Extract structured detail from a warning product.
+
+    Pulls the bullet-point lines like:
+      * Timing...12 PM CDT through 8 PM CDT Monday.
+      * Wind...Southwest at 20 to 30 mph with gusts to 40 mph.
+      * Humidity...As low as 12 percent.
+
+    Also grabs WHAT/WHERE/WHEN/IMPACTS blocks from newer NWS format.
+    Returns a compact multiline string, max ~500 chars.
+    """
+    lines: list[str] = []
+    in_bullets = False
+
+    for line in text.splitlines():
+        s = line.strip()
+
+        # Bullet-point lines: "* Wind...Southwest 20-30 mph"
+        if s.startswith("* "):
+            in_bullets = True
+            # Clean up: "* Wind...text" → "Wind: text"
+            content = s[2:]
+            if "..." in content:
+                label, _, detail = content.partition("...")
+                content = f"{label.strip()}: {detail.strip()}"
+            lines.append(content)
+            continue
+
+        # Continuation of a bullet (indented)
+        if in_bullets and s and not s.startswith("*") and not s.startswith("PRECAUTIONARY"):
+            if s.startswith("&&") or s.startswith("$$"):
+                break
+            # Append to previous line
+            if lines:
+                lines[-1] += " " + s
+            continue
+
+        # WHAT/WHERE/WHEN/IMPACTS blocks (newer NWS format)
+        for tag in ("WHAT", "WHERE", "WHEN", "IMPACTS", "ADDITIONAL DETAILS"):
+            if s.startswith(tag + "..."):
+                content = s[len(tag) + 3:].strip()
+                lines.append(f"{tag.title()}: {content}")
+                in_bullets = True
+                break
+
+        if s.startswith("PRECAUTIONARY") or s.startswith("&&"):
+            break
+
+    result = "\n".join(lines)
+    return result[:500] if result else ""
+
+
 def _polygon_from_sbw(sbw) -> list[tuple[float, float]]:
     """Convert a pyIEM/Shapely polygon to (lat, lon) vertex list.
 
@@ -308,9 +376,15 @@ def _segment_to_entry(seg, parsed, prod, now: datetime) -> dict | None:
     if len(vertices) < 3 and not zones:
         return None
 
-    # Headline: prefer pyIEM's canonical ...HEADLINE... block
+    # Headline: prefer pyIEM's canonical ...HEADLINE... block.
+    # Fall back to extracting ...TEXT... from the raw product if empty.
     headline_raw = seg.headlines[0] if seg.headlines else ""
+    if not headline_raw:
+        headline_raw = _extract_headline_from_body(prod.raw_text)
     headline = _shorten_headline(headline_raw)
+
+    # Description: structured detail lines (Wind, Humidity, Timing, Impacts)
+    description = _extract_warning_description(prod.raw_text)
 
     expiry_minutes = max(0, int((expires_at - now).total_seconds() / 60))
 
@@ -326,6 +400,7 @@ def _segment_to_entry(seg, parsed, prod, now: datetime) -> dict | None:
         "expiry_minutes": expiry_minutes,  # convenience — minutes from "now"
         "vertices": vertices,
         "headline": headline,
+        "description": description,
         "zones": sorted(zones),
         # Extended metadata
         "ugcs": sorted(ugcs),
@@ -416,6 +491,7 @@ def _extract_warnings_fallback(store: WeatherStore) -> list[dict]:
             "expiry_minutes": expiry_minutes,
             "vertices": vertices,
             "headline": _shorten_headline(store._short_headline(prod.raw_text)),
+            "description": _extract_warning_description(prod.raw_text),
             "zones": sorted(zones),
             "ugcs": sorted(zones),
             "product_type": prod.product_type,
@@ -470,9 +546,10 @@ def extract_active_warnings(
 def warnings_to_binary(warnings: list[dict], prefer_zones: bool = True) -> list[bytes]:
     """Pack a list of warning dicts into MeshWX binary messages.
 
-    Uses the v3 wire format: absolute expiry timestamp (uint32 Unix minutes)
-    instead of relative "expiry_minutes". The client computes time remaining
-    from its own clock.
+    Each warning produces:
+      1. A 0x20 (polygon) or 0x21 (zones) message with headline
+      2. Optionally, 0x40 text chunk(s) with the detailed description
+         (wind speeds, humidity, impacts, etc.)
     """
     msgs: list[bytes] = []
     for w in warnings:
@@ -506,6 +583,21 @@ def warnings_to_binary(warnings: list[dict], prefer_zones: bool = True) -> list[
             else:
                 continue
             msgs.append(msg)
+
+            # Send description as text chunk if available
+            desc = w.get("description", "")
+            if desc:
+                from meshcore_weather.protocol.meshwx import (
+                    LOC_WFO, TEXT_SUBJECT_GENERAL, pack_text_chunks,
+                )
+                wfo = w.get("vtec_office", "UNK") or "UNK"
+                desc_msgs = pack_text_chunks(
+                    subject_type=TEXT_SUBJECT_GENERAL,
+                    loc_type=LOC_WFO,
+                    loc_id=wfo,
+                    text=desc,
+                )
+                msgs.extend(desc_msgs)
         except Exception:
             logger.debug("Failed to pack warning: %s", w.get("headline", "?")[:40])
     return msgs

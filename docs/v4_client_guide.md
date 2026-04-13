@@ -287,7 +287,16 @@ If multiple warnings affect the zone, their descriptions are separated by `---`.
 2. User taps warning → send `0x02` data request with `data_type=0x08`, `location=LOC_ZONE` for one of the warning's zone codes
 3. Receive 0x40 text chunks → display in warning detail view
 
-**Fire warnings (0x7):** These are zone-based (0x21), not polygon-based. The zone codes in the message ARE the location — the client renders them using its preloaded zone polygon geometries. Fire weather zones cover large areas (counties/regions), unlike storm-scale tornado polygons.
+**Zone polygon rendering:** Zone-based warnings (0x21) use NWS zone codes like `TXZ192`. The iOS app must bundle the official NWS zone boundary shapefiles to draw these on the map. Download from:
+
+- Public forecast zones: `https://www.weather.gov/source/gis/Shapefiles/WSOM/z_16ap26.zip`
+- Fire weather zones: `https://www.weather.gov/source/gis/Shapefiles/WSOM/fz16ap26.zip`
+- Marine zones: `https://www.weather.gov/source/gis/Shapefiles/WSOM/mz16ap26.zip`
+- Offshore zones: `https://www.weather.gov/source/gis/Shapefiles/WSOM/oz16ap26.zip`
+
+Convert to GeoJSON at build time and bundle in the app. Match zone codes via the `STATE` + `ZONE` columns (e.g. `TX` + `192` → `TXZ192`). These files update ~2x/year.
+
+**Fire warnings (0x7):** These are zone-based (0x21), not polygon-based. The zone codes in the message ARE the location. Fire weather zones cover large areas (counties/regions), unlike storm-scale tornado polygons.
 
 ---
 

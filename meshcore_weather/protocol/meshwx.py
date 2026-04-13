@@ -278,16 +278,18 @@ def unpack_radar_grid(data: bytes) -> dict:
     }
 
 
-# -- Compressed Radar Grid (0x11) v3 — 32×32 or 64×64 with sparse/RLE --------
+# -- Compressed Radar Grid (0x11) v4 — 32×32 or 64×64 with sparse/RLE --------
 #
 # Wire format:
 #   byte 0     : 0x11 MSG_RADAR_COMPRESSED
 #   byte 1     : region_id (hi nibble) | chunk_seq (lo nibble)
 #                chunk_seq: 0 for single-message grids, 0-N for multi-msg
 #   byte 2     : grid_size (32 or 64)
-#   byte 3-4   : timestamp_utc_min (uint16 BE)
-#   byte 5     : scale_km (uint8)
-#   byte 6     : encoding (hi nibble) | total_chunks (lo nibble)
+#   bytes 3-6  : timestamp_unix_min (uint32 BE, minutes since Unix epoch)
+#                Absolute — client uses this for dedup (same region+timestamp = skip)
+#                and display ("Radar as of 14:10 UTC")
+#   byte 7     : scale_km (uint8)
+#   byte 8     : encoding (hi nibble) | total_chunks (lo nibble)
 #                encoding: 0 = sparse, 1 = RLE
 #   bytes 7+   : encoded grid data (format depends on encoding byte)
 #
@@ -401,8 +403,8 @@ def pack_radar_compressed(
         encoded = rle_data
 
     # Split into chunks that fit in one frame
-    # Header = 7 bytes, max payload per frame = 136 - 7 = 129
-    max_payload = 129
+    # Header = 9 bytes, max payload per frame = 136 - 9 = 127
+    max_payload = 127
     chunks = []
     offset = 0
     while offset < len(encoded):
@@ -418,7 +420,7 @@ def pack_radar_compressed(
         msg.append(MSG_RADAR_COMPRESSED)
         msg.append(((region_id & 0x0F) << 4) | (seq & 0x0F))
         msg.append(grid_size & 0xFF)
-        msg.extend(struct.pack(">H", timestamp_utc_min & 0xFFFF))
+        msg.extend(struct.pack(">I", timestamp_utc_min & 0xFFFFFFFF))
         msg.append(scale_km & 0xFF)
         msg.append(((encoding & 0x0F) << 4) | (total_chunks & 0x0F))
         msg.extend(chunk)
@@ -435,16 +437,16 @@ def unpack_radar_compressed(data: bytes) -> dict:
     reassembled payload. For single-chunk messages (the common case),
     this returns the complete grid directly.
     """
-    if len(data) < 7 or data[0] != MSG_RADAR_COMPRESSED:
+    if len(data) < 9 or data[0] != MSG_RADAR_COMPRESSED:
         raise ValueError("Invalid compressed radar message")
     region_id = (data[1] >> 4) & 0x0F
     chunk_seq = data[1] & 0x0F
     grid_size = data[2]
-    timestamp = struct.unpack_from(">H", data, 3)[0]
-    scale_km = data[5]
-    encoding = (data[6] >> 4) & 0x0F
-    total_chunks = data[6] & 0x0F
-    payload = data[7:]
+    timestamp = struct.unpack_from(">I", data, 3)[0]
+    scale_km = data[7]
+    encoding = (data[8] >> 4) & 0x0F
+    total_chunks = data[8] & 0x0F
+    payload = data[9:]
 
     # For single-chunk messages, decode the grid immediately.
     # For multi-chunk, return the raw payload and metadata so the caller

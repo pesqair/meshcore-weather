@@ -147,11 +147,11 @@ async def fetch_radar_composite(client: httpx.AsyncClient) -> tuple[bytes, int] 
             logger.warning("Failed to fetch radar composite: %s", e)
             return None
 
-    # Timestamp as minutes since midnight UTC
-    ts_minutes = now.hour * 60 + now.minute
+    # Timestamp as absolute Unix minutes (minutes since epoch)
+    ts_unix_min = int(now.timestamp()) // 60
     logger.info("Fetched radar composite (%d bytes, %02d:%02d UTC)",
                 len(resp.content), now.hour, now.minute)
-    return resp.content, ts_minutes
+    return resp.content, ts_unix_min
 
 
 def build_radar_messages(

@@ -337,7 +337,7 @@ These arrive with the v4 header. Unwrap the header, prepend msg_type, and use ex
 
 | Type | Code | Notes |
 |------|------|-------|
-| Radar compressed | 0x11 | 32x32 non-FEC or individual FEC unit |
+| Radar compressed | 0x11 | See updated format below |
 | Observation | 0x30 | Unchanged |
 | Forecast | 0x31 | May be sourced from SFT (nationwide) in addition to PFM/ZFP |
 | Outlook | 0x32 | Unchanged |
@@ -347,6 +347,23 @@ These arrive with the v4 header. Unwrap the header, prepend msg_type, and use ex
 | TAF | 0x36 | Unchanged |
 | Warnings near | 0x37 | Unchanged |
 | Text chunk | 0x40 | New subject_type 0x08 = nowcast overflow |
+
+**0x11 Radar Compressed (updated header):**
+
+```
+byte 0     : 0x11
+byte 1     : region_id (hi nibble) | chunk_seq (lo nibble)
+byte 2     : grid_size (32 or 64)
+bytes 3-6  : timestamp_unix_min (uint32 BE — minutes since Unix epoch)
+byte 7     : scale_km (uint8)
+byte 8     : encoding (hi nibble: 0=sparse, 1=RLE) | total_chunks (lo nibble)
+bytes 9+   : encoded grid data
+```
+
+The timestamp is now absolute (was uint16 minutes-since-midnight). This enables:
+- **Dedup:** Client checks `(region_id, timestamp)` — if already seen, skip it
+- **Display:** "Radar as of 14:10 UTC" from the actual scan time, not arrival time
+- **Staleness:** Client can show "15 min old" and grey out data older than threshold
 
 ---
 

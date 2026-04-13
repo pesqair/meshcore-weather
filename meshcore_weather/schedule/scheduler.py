@@ -256,45 +256,29 @@ class Scheduler:
                 self._last_bytes[job.id] = 0
                 continue
 
-            sent_bytes = 0
-            has_v4 = self.radio.v4_channel_idx is not None
+            # Build v4 messages — FEC for eligible products, v4 wrapping for others
+            if job.product in _FEC_PRODUCTS:
+                v4_msgs = self._build_fec_messages(job, ctx)
+            else:
+                v4_msgs = [v4_wrap(m, self._v4_seq.next()) for m in msgs]
 
-            # v3 broadcast (existing data channel) — always send
-            for msg in msgs:
+            sent_bytes = 0
+            for v4_msg in v4_msgs:
                 try:
-                    await self.radio.send_binary_channel(cobs_encode(msg))
-                    sent_bytes += len(msg)
+                    await self.radio.send_binary_channel(cobs_encode(v4_msg))
+                    sent_bytes += len(v4_msg)
                     total_sent += 1
                     await asyncio.sleep(TX_SPACING)
                 except Exception:
-                    logger.exception("Scheduler: v3 send failed for job %s", job.id)
-
-            # v4 broadcast — FEC-eligible products get spatial/section FEC,
-            # others get simple v4 frame wrapping
-            v4_count = 0
-            if has_v4:
-                if job.product in _FEC_PRODUCTS:
-                    v4_msgs = self._build_fec_messages(job, ctx)
-                else:
-                    v4_msgs = [v4_wrap(m, self._v4_seq.next()) for m in msgs]
-                for v4_msg in v4_msgs:
-                    try:
-                        await self.radio.send_binary_v4(cobs_encode(v4_msg))
-                        sent_bytes += len(v4_msg)
-                        v4_count += 1
-                        total_sent += 1
-                        await asyncio.sleep(TX_SPACING)
-                    except Exception:
-                        logger.exception("Scheduler: v4 send failed for job %s", job.id)
+                    logger.exception("Scheduler: send failed for job %s", job.id)
 
             self._last_bytes[job.id] = sent_bytes
             self._total_bytes[job.id] = self._total_bytes.get(job.id, 0) + sent_bytes
-            self._last_msg_count[job.id] = len(msgs)
-            v4_tag = f" +v4({v4_count})" if v4_count else ""
+            self._last_msg_count[job.id] = len(v4_msgs)
             activity_log.record(EventDir.OUT, "broadcast",
-                f"Job {job.id}: {len(msgs)} msg(s), {sent_bytes}B ({job.product}{v4_tag})",
-                {"job_id": job.id, "product": job.product, "messages": len(msgs), "bytes": sent_bytes})
-            activity_log.record_send(len(msgs), sent_bytes)
+                f"Job {job.id}: {len(v4_msgs)} msg(s), {sent_bytes}B ({job.product})",
+                {"job_id": job.id, "product": job.product, "messages": len(v4_msgs), "bytes": sent_bytes})
+            activity_log.record_send(len(v4_msgs), sent_bytes)
             logger.info(
                 "scheduler: %s → %d msg(s), %d bytes (%s)",
                 job.id, len(msgs), sent_bytes, job.product,
@@ -415,19 +399,21 @@ class Scheduler:
         self._last_run[job.id] = now
         self._total_runs[job.id] = self._total_runs.get(job.id, 0) + 1
         self._last_msg_count[job.id] = len(msgs)
+
+        # Wrap in v4 frames (FEC for eligible products)
+        if job.product in _FEC_PRODUCTS:
+            v4_msgs = self._build_fec_messages(job, ctx)
+        else:
+            v4_msgs = [v4_wrap(m, self._v4_seq.next()) for m in msgs]
+
         sent_bytes = 0
-        has_v4 = self.radio.v4_channel_idx is not None
-        for msg in msgs:
+        for v4_msg in v4_msgs:
             try:
-                await self.radio.send_binary_channel(cobs_encode(msg))
-                sent_bytes += len(msg)
-                if has_v4:
-                    v4_msg = v4_wrap(msg, self._v4_seq.next())
-                    await self.radio.send_binary_v4(cobs_encode(v4_msg))
-                    sent_bytes += len(v4_msg)
+                await self.radio.send_binary_channel(cobs_encode(v4_msg))
+                sent_bytes += len(v4_msg)
                 await asyncio.sleep(TX_SPACING)
             except Exception:
                 logger.exception("run_job_now: send failed for %s", job_id)
         self._last_bytes[job.id] = sent_bytes
         self._total_bytes[job.id] = self._total_bytes.get(job.id, 0) + sent_bytes
-        return len(msgs)
+        return len(v4_msgs)

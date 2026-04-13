@@ -358,10 +358,9 @@ async def set_channels(request: Request) -> JSONResponse:
     body = await request.json()
     text_ch = body.get("text_channel", "").strip()
     data_ch = body.get("data_channel", "").strip()
-    v4_ch = body.get("v4_channel", "").strip()
 
     # Validate: channel names should start with # or be a numeric index
-    for name, val in [("text_channel", text_ch), ("data_channel", data_ch), ("v4_channel", v4_ch)]:
+    for name, val in [("text_channel", text_ch), ("data_channel", data_ch)]:
         if val and not val.startswith("#") and not val.isdigit():
             raise HTTPException(400, f"{name} must start with '#' or be a numeric index")
 
@@ -372,11 +371,9 @@ async def set_channels(request: Request) -> JSONResponse:
     if env_path.exists():
         env_lines = env_path.read_text().splitlines()
 
-    # Update or add each setting
     env_map = {
         "MCW_MESHCORE_CHANNEL": text_ch,
         "MCW_MESHWX_CHANNEL": data_ch,
-        "MCW_MESHWX_V4_CHANNEL": v4_ch,
     }
     for key, val in env_map.items():
         found = False
@@ -394,7 +391,6 @@ async def set_channels(request: Request) -> JSONResponse:
         "ok": True,
         "text_channel": text_ch,
         "data_channel": data_ch,
-        "v4_channel": v4_ch,
         "note": "Restart required for changes to take effect",
     })
 

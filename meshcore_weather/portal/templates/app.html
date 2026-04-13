@@ -246,28 +246,23 @@
             <div class="card-subtitle">Channel names for text commands, v3 data, and v4 deployment</div>
           </div>
         </div>
-        <div class="grid grid-3 mb-4">
+        <div class="grid grid-2 mb-4">
           <div>
             <label class="form-label">Text Channel</label>
             <input type="text" class="input" id="sys-ch-text" placeholder="#wx-bot">
-            <span class="form-hint">Text command channel (v3)</span>
+            <span class="form-hint">Text command channel (DMs and chat commands)</span>
           </div>
           <div>
-            <label class="form-label">v3 Data Channel</label>
+            <label class="form-label">Data Channel</label>
             <input type="text" class="input" id="sys-ch-data" placeholder="#meshwx-data">
-            <span class="form-hint">Binary broadcast channel (v3)</span>
-          </div>
-          <div>
-            <label class="form-label">v4 Channel</label>
-            <input type="text" class="input" id="sys-ch-v4" placeholder="#aus-meshwx-v4">
-            <span class="form-hint">v4 deployment channel (dual-broadcast)</span>
+            <span class="form-hint">v4 binary broadcast channel (radar, forecasts, warnings)</span>
           </div>
         </div>
         <div class="flex gap-2 mb-4" style="align-items: center;">
           <button class="btn btn-primary" onclick="Portal.system.saveChannels(this)">Save Channels</button>
           <span id="sys-ch-status" class="text-small text-muted"></span>
         </div>
-        <div class="text-small text-muted">Requires restart. When a v4 channel is set, the scheduler dual-broadcasts every product on both v3 and v4 channels.</div>
+        <div class="text-small text-muted">Requires restart. All broadcasts use v4 framing with FEC for radar and text products.</div>
       </div>
 
       <div class="card">

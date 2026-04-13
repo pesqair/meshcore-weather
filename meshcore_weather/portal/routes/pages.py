@@ -49,11 +49,9 @@ async def app_page(request: Request):
         "product_count": len(bot.store._products),
         "channel_idx": bot.radio.channel_idx if bot.radio else None,
         "data_channel": bot.radio.data_channel_idx if bot.radio else None,
-        "v4_channel": bot.radio.v4_channel_idx if bot.radio else None,
         "channel_config": {
             "text_channel": settings.meshcore_channel,
             "data_channel": settings.meshwx_channel,
-            "v4_channel": settings.meshwx_v4_channel,
         },
     }
     return templates.TemplateResponse(

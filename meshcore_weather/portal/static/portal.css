@@ -709,8 +709,8 @@ input[type="search"] {
 .table-compact { font-size: 0.8rem; }
 .table-compact td, .table-compact th { padding: 3px 8px; }
 
-/* Bump main content so it doesn't hide behind the collapsed panel */
-.main { padding-bottom: 44px; }
+/* Bump main content so it doesn't hide behind the activity panel */
+.main { padding-bottom: 300px; }
 
 /* Flash animation for new rows */
 @keyframes rowFlash {

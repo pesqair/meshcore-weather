@@ -1,95 +1,89 @@
-"""HTML page routes for the portal."""
+"""HTML page routes for the portal — single SPA entry point."""
+
+import json
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
+
+from meshcore_weather.config import settings
 
 router = APIRouter()
 
+# Legacy path → hash-section mapping
+_LEGACY = {
+    "/config": "/#system",
+    "/schedule": "/#broadcast",
+    "/data": "/#map",
+    "/products": "/#broadcast",
+    "/status": "/#overview",
+}
+
 
 @router.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+async def app_page(request: Request):
+    """Serve the single-page app with bootstrap data."""
     templates = request.app.state.templates
     bot = request.app.state.bot
     broadcaster = getattr(bot, "_broadcaster", None)
     coverage = broadcaster.coverage if broadcaster else None
-    return templates.TemplateResponse(
-        request,
-        "index.html",
-        {
-            "page": "index",
-            "coverage": coverage,
-            "product_count": len(bot.store._products),
-            "channel_name": bot.radio.channel_idx if bot.radio else None,
-            "data_channel": bot.radio.data_channel_idx if bot.radio else None,
+
+    boot = {
+        "coverage_sources": (
+            coverage.sources
+            if coverage
+            else {"cities": [], "states": [], "wfos": []}
+        ),
+        "coverage_summary": (
+            coverage.summary()
+            if coverage and not coverage.is_empty()
+            else None
+        ),
+        "zone_count": (
+            len(coverage.zones) if coverage and not coverage.is_empty() else 0
+        ),
+        "region_count": (
+            len(coverage.region_ids)
+            if coverage and not coverage.is_empty()
+            else 0
+        ),
+        "product_count": len(bot.store._products),
+        "channel_idx": bot.radio.channel_idx if bot.radio else None,
+        "data_channel": bot.radio.data_channel_idx if bot.radio else None,
+        "v4_channel": bot.radio.v4_channel_idx if bot.radio else None,
+        "channel_config": {
+            "text_channel": settings.meshcore_channel,
+            "data_channel": settings.meshwx_channel,
+            "v4_channel": settings.meshwx_v4_channel,
         },
-    )
-
-
-@router.get("/config", response_class=HTMLResponse)
-async def config_page(request: Request):
-    templates = request.app.state.templates
-    bot = request.app.state.bot
-    broadcaster = getattr(bot, "_broadcaster", None)
-    coverage = broadcaster.coverage if broadcaster else None
+    }
     return templates.TemplateResponse(
         request,
-        "config.html",
-        {"page": "config", "coverage": coverage},
+        "app.html",
+        {"boot_json": json.dumps(boot)},
     )
 
 
-@router.get("/schedule", response_class=HTMLResponse)
-async def schedule_page(request: Request):
-    """Broadcast schedule management page."""
-    templates = request.app.state.templates
-    bot = request.app.state.bot
-    data_channel = (
-        bot.radio.data_channel_idx if bot.radio else None
-    )
-    return templates.TemplateResponse(
-        request,
-        "schedule.html",
-        {"page": "schedule", "data_channel": data_channel},
-    )
+# Legacy redirects so old bookmarks still work
+@router.get("/config")
+async def legacy_config():
+    return RedirectResponse(_LEGACY["/config"])
 
 
-@router.get("/data", response_class=HTMLResponse)
-async def data_page(request: Request):
-    templates = request.app.state.templates
-    bot = request.app.state.bot
-    broadcaster = getattr(bot, "_broadcaster", None)
-    coverage = broadcaster.coverage if broadcaster else None
-    return templates.TemplateResponse(
-        request,
-        "data.html",
-        {"page": "data", "coverage": coverage},
-    )
+@router.get("/schedule")
+async def legacy_schedule():
+    return RedirectResponse(_LEGACY["/schedule"])
 
 
-@router.get("/products", response_class=HTMLResponse)
-async def products_page(request: Request):
-    templates = request.app.state.templates
-    bot = request.app.state.bot
-    types = sorted({p.product_type for p in bot.store._products.values()})
-    offices = sorted({p.office for p in bot.store._products.values() if p.office})
-    states = sorted({p.state for p in bot.store._products.values() if p.state})
-    return templates.TemplateResponse(
-        request,
-        "products.html",
-        {
-            "page": "products",
-            "types": types,
-            "offices": offices,
-            "states": states,
-        },
-    )
+@router.get("/data")
+async def legacy_data():
+    return RedirectResponse(_LEGACY["/data"])
 
 
-@router.get("/status", response_class=HTMLResponse)
-async def status_page(request: Request):
-    templates = request.app.state.templates
-    return templates.TemplateResponse(
-        request,
-        "status.html",
-        {"page": "status"},
-    )
+@router.get("/products")
+async def legacy_products():
+    return RedirectResponse(_LEGACY["/products"])
+
+
+@router.get("/status")
+async def legacy_status():
+    return RedirectResponse(_LEGACY["/status"])

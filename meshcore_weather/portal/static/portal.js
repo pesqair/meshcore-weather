@@ -926,6 +926,7 @@ var Portal = {
         this.render(window.__BOOT__);
         this.initPreviewMap();
         this.loadRadarGrid();
+        this.loadChannels();
       }
     },
 
@@ -1008,6 +1009,46 @@ var Portal = {
       }).catch(function (e) {
         statusEl.innerHTML = '<span style="color:var(--color-danger);">' + escapeHtml(e.message) + '</span>';
       });
+    },
+
+    loadChannels: function () {
+      var boot = window.__BOOT__;
+      var cfg = boot.channel_config || {};
+      document.getElementById("sys-ch-text").value = cfg.text_channel || "";
+      document.getElementById("sys-ch-data").value = cfg.data_channel || "";
+      document.getElementById("sys-ch-v4").value = cfg.v4_channel || "";
+      // Show active channel indices
+      var parts = [];
+      if (boot.channel_idx != null) parts.push("text: ch" + boot.channel_idx);
+      if (boot.data_channel != null) parts.push("v3 data: ch" + boot.data_channel);
+      if (boot.v4_channel != null) parts.push("v4: ch" + boot.v4_channel);
+      document.getElementById("sys-ch-status").textContent = parts.length
+        ? "Active: " + parts.join(", ")
+        : "No data channels active";
+    },
+
+    saveChannels: function (btn) {
+      var statusEl = document.getElementById("sys-ch-status");
+      statusEl.textContent = "Saving\u2026";
+      btn.disabled = true;
+      var body = {
+        text_channel: document.getElementById("sys-ch-text").value.trim(),
+        data_channel: document.getElementById("sys-ch-data").value.trim(),
+        v4_channel: document.getElementById("sys-ch-v4").value.trim(),
+      };
+      fetch("/api/settings/channels", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || r.status); });
+        return r.json();
+      }).then(function () {
+        statusEl.innerHTML = '<span style="color:var(--color-success);">Saved. Restart bot to apply.</span>';
+        Portal.ui.showToast("Channel config saved. Restart the bot to apply changes.");
+      }).catch(function (e) {
+        statusEl.innerHTML = '<span style="color:var(--color-danger);">' + escapeHtml(e.message) + '</span>';
+      }).finally(function () { btn.disabled = false; });
     },
   },
 

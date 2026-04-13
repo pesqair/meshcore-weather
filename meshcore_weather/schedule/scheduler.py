@@ -27,11 +27,12 @@ from pathlib import Path
 
 import httpx
 
+from meshcore_weather.activity import EventDir, activity_log
 from meshcore_weather.config import settings
 from meshcore_weather.meshcore.radio import MeshcoreRadio
 from meshcore_weather.parser.weather import WeatherStore
 from meshcore_weather.protocol.coverage import Coverage
-from meshcore_weather.protocol.meshwx import cobs_encode
+from meshcore_weather.protocol.meshwx import V4SequenceCounter, cobs_encode, v4_wrap
 from meshcore_weather.protocol.radar import fetch_radar_composite
 from meshcore_weather.schedule.executor import BroadcastExecutor, ExecutorContext
 from meshcore_weather.schedule.models import BroadcastConfig, BroadcastJob
@@ -83,6 +84,9 @@ class Scheduler:
         # Key: warning identity (VTEC key string)
         # Value: (expires_unix_min, headline_hash)
         self._warning_tracking: dict[str, tuple[int, int]] = {}
+
+        # v4 sequence counter — monotonic across all messages on the v4 channel
+        self._v4_seq = V4SequenceCounter()
 
         self._task: asyncio.Task | None = None
         self._running = False
@@ -248,17 +252,33 @@ class Scheduler:
                 continue
 
             sent_bytes = 0
+            has_v4 = self.radio.v4_channel_idx is not None
             for msg in msgs:
                 try:
+                    # v3 broadcast (existing data channel)
                     await self.radio.send_binary_channel(cobs_encode(msg))
                     sent_bytes += len(msg)
                     total_sent += 1
+
+                    # v4 broadcast (v4 channel with frame header)
+                    if has_v4:
+                        v4_msg = v4_wrap(msg, self._v4_seq.next())
+                        await self.radio.send_binary_v4(cobs_encode(v4_msg))
+                        sent_bytes += len(v4_msg)
+                        total_sent += 1
+
                     await asyncio.sleep(TX_SPACING)
                 except Exception:
                     logger.exception("Scheduler: send failed for job %s", job.id)
 
             self._last_bytes[job.id] = sent_bytes
             self._total_bytes[job.id] = self._total_bytes.get(job.id, 0) + sent_bytes
+            self._last_msg_count[job.id] = len(msgs)
+            v4_tag = " +v4" if has_v4 else ""
+            activity_log.record(EventDir.OUT, "broadcast",
+                f"Job {job.id}: {len(msgs)} msg(s), {sent_bytes}B ({job.product}{v4_tag})",
+                {"job_id": job.id, "product": job.product, "messages": len(msgs), "bytes": sent_bytes})
+            activity_log.record_send(len(msgs), sent_bytes)
             logger.info(
                 "scheduler: %s → %d msg(s), %d bytes (%s)",
                 job.id, len(msgs), sent_bytes, job.product,
@@ -321,10 +341,15 @@ class Scheduler:
         self._total_runs[job.id] = self._total_runs.get(job.id, 0) + 1
         self._last_msg_count[job.id] = len(msgs)
         sent_bytes = 0
+        has_v4 = self.radio.v4_channel_idx is not None
         for msg in msgs:
             try:
                 await self.radio.send_binary_channel(cobs_encode(msg))
                 sent_bytes += len(msg)
+                if has_v4:
+                    v4_msg = v4_wrap(msg, self._v4_seq.next())
+                    await self.radio.send_binary_v4(cobs_encode(v4_msg))
+                    sent_bytes += len(v4_msg)
                 await asyncio.sleep(TX_SPACING)
             except Exception:
                 logger.exception("run_job_now: send failed for %s", job_id)

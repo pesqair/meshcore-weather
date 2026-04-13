@@ -81,6 +81,78 @@ MSG_NOWCAST = 0x3C       # v4: short-term forecast (NOW)
 MSG_QPF_GRID = 0x12      # v4: QPF precipitation grid (same encoding as 0x11)
 MSG_TEXT_CHUNK = 0x40    # v2: compressed text fallback
 
+# -- v4 frame format --
+V4_VERSION = 0x04  # Protocol version byte (first byte of every v4 frame)
+
+
+def v4_wrap(msg: bytes, seq: int, flags: int = 0, group_total: int = 0) -> bytes:
+    """Wrap a v3-format message in a v4 frame header.
+
+    v4 frame layout (6 bytes prepended):
+      byte 0: 0x04 (protocol version)
+      byte 1: msg_type (copied from msg[0])
+      byte 2: msg_flags (FEC bits — 0 for single-message products)
+      byte 3: group_total_units (0 if not FEC)
+      bytes 4-5: sequence_number (uint16 BE, monotonic per bot)
+      bytes 6+: original payload (msg[1:])
+
+    The msg_type is extracted from the v3 message's first byte and
+    placed in the v4 header. The original payload follows WITHOUT its
+    type byte (since it's now in the header).
+    """
+    if not msg:
+        return msg
+    header = struct.pack(">BBBBH",
+        V4_VERSION,
+        msg[0],           # msg_type from the v3 message
+        flags & 0xFF,
+        group_total & 0xFF,
+        seq & 0xFFFF,
+    )
+    return header + msg[1:]  # payload without the type byte
+
+
+def v4_unwrap(data: bytes) -> tuple[bytes, int, int]:
+    """Unwrap a v4 frame, returning (v3_message, seq_number, flags).
+
+    Reconstructs the v3-format message by prepending the msg_type byte
+    back onto the payload.
+    """
+    if len(data) < 6 or data[0] != V4_VERSION:
+        raise ValueError("Not a v4 frame")
+    msg_type = data[1]
+    flags = data[2]
+    # group_total = data[3]
+    seq = struct.unpack_from(">H", data, 4)[0]
+    v3_msg = bytes([msg_type]) + data[6:]
+    return v3_msg, seq, flags
+
+
+def is_v4_frame(data: bytes) -> bool:
+    """Check if data starts with a v4 frame header."""
+    return len(data) >= 6 and data[0] == V4_VERSION
+
+
+class V4SequenceCounter:
+    """Monotonic uint16 sequence counter for v4 frames.
+
+    One counter per bot — increments with each message sent on the v4
+    channel. Wraps from 65535 to 0.
+    """
+
+    def __init__(self) -> None:
+        self._seq: int = 0
+
+    def next(self) -> int:
+        seq = self._seq
+        self._seq = (self._seq + 1) & 0xFFFF
+        return seq
+
+    @property
+    def current(self) -> int:
+        return self._seq
+
+
 # -- Warning type nibbles (high nibble of byte 1) --
 WARN_TORNADO = 0x1
 WARN_SEVERE_TSTORM = 0x2

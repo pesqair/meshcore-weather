@@ -28,6 +28,7 @@ class MeshcoreRadio:
         self._running = False
         self._channel_idx: int | None = None
         self._data_channel_idx: int | None = None
+        self._v4_channel_idx: int | None = None
         self._channel_handler: Callable | None = None
         self._dm_handler: Callable | None = None
         self._advert_handler: Callable | None = None
@@ -89,6 +90,20 @@ class MeshcoreRadio:
                 else:
                     logger.warning("Could not create data channel '%s' — no free slots",
                                    settings.meshwx_channel)
+
+        # Resolve v4 deployment channel (if configured)
+        if settings.meshwx_v4_channel:
+            try:
+                self._v4_channel_idx = await self._resolve_channel(settings.meshwx_v4_channel)
+                logger.info("v4 channel %d (%s)", self._v4_channel_idx, settings.meshwx_v4_channel)
+            except ValueError:
+                created = await self._create_channel(settings.meshwx_v4_channel)
+                if created is not None:
+                    self._v4_channel_idx = created
+                    logger.info("Created v4 channel %d (%s)", created, settings.meshwx_v4_channel)
+                else:
+                    logger.warning("Could not create v4 channel '%s' — no free slots",
+                                   settings.meshwx_v4_channel)
 
         # Subscribe to channel messages, DMs, and new adverts
         self._mc.subscribe(EventType.CHANNEL_MSG_RECV, self._on_channel_msg)
@@ -234,6 +249,33 @@ class MeshcoreRadio:
             except Exception:
                 logger.exception("Failed to send binary on data channel")
 
+    async def send_binary_v4(self, payload: bytes) -> None:
+        """Send raw binary data on the v4 deployment channel.
+
+        Same as send_binary_channel but targets the v4 channel slot.
+        Shares the same send_lock to prevent interleaving.
+        """
+        if not self._mc or self._v4_channel_idx is None:
+            return
+        async with self.send_lock:
+            import time as _time
+            ts_bytes = int(_time.time()).to_bytes(4, "little")
+            data = (
+                b"\x03\x00"
+                + self._v4_channel_idx.to_bytes(1, "little")
+                + ts_bytes
+                + payload
+            )
+            try:
+                result = await self._mc.commands.send(data, [EventType.OK, EventType.ERROR])
+                if result.type == EventType.ERROR:
+                    logger.warning("v4 send failed on ch %d: %s", self._v4_channel_idx, result.payload)
+                else:
+                    logger.info("v4 sent on ch %d: %d bytes (type 0x%02x)",
+                                self._v4_channel_idx, len(payload), payload[1] if len(payload) > 1 else 0)
+            except Exception:
+                logger.exception("Failed to send binary on v4 channel")
+
     async def send_dm(self, pubkey_prefix: str, text: str) -> bool:
         """Send a direct message to a contact by their public key prefix."""
         if not self._mc:
@@ -366,3 +408,7 @@ class MeshcoreRadio:
     @property
     def data_channel_idx(self) -> int | None:
         return self._data_channel_idx
+
+    @property
+    def v4_channel_idx(self) -> int | None:
+        return self._v4_channel_idx

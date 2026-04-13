@@ -347,6 +347,58 @@ async def set_radar_grid_size(request: Request) -> JSONResponse:
     return JSONResponse({"ok": True, "radar_grid_size": grid_size})
 
 
+@router.post("/settings/channels")
+async def set_channels(request: Request) -> JSONResponse:
+    """Save channel configuration to the .env file.
+
+    Channel changes require a bot restart to take effect since the radio
+    resolves channels at startup. We persist to .env so the next startup
+    picks up the new values.
+    """
+    body = await request.json()
+    text_ch = body.get("text_channel", "").strip()
+    data_ch = body.get("data_channel", "").strip()
+    v4_ch = body.get("v4_channel", "").strip()
+
+    # Validate: channel names should start with # or be a numeric index
+    for name, val in [("text_channel", text_ch), ("data_channel", data_ch), ("v4_channel", v4_ch)]:
+        if val and not val.startswith("#") and not val.isdigit():
+            raise HTTPException(400, f"{name} must start with '#' or be a numeric index")
+
+    # Persist to .env file
+    from pathlib import Path
+    env_path = Path(".env")
+    env_lines: list[str] = []
+    if env_path.exists():
+        env_lines = env_path.read_text().splitlines()
+
+    # Update or add each setting
+    env_map = {
+        "MCW_MESHCORE_CHANNEL": text_ch,
+        "MCW_MESHWX_CHANNEL": data_ch,
+        "MCW_MESHWX_V4_CHANNEL": v4_ch,
+    }
+    for key, val in env_map.items():
+        found = False
+        for i, line in enumerate(env_lines):
+            if line.startswith(f"{key}=") or line.startswith(f"# {key}="):
+                env_lines[i] = f"{key}={val}" if val else f"# {key}="
+                found = True
+                break
+        if not found and val:
+            env_lines.append(f"{key}={val}")
+
+    env_path.write_text("\n".join(env_lines) + "\n")
+
+    return JSONResponse({
+        "ok": True,
+        "text_channel": text_ch,
+        "data_channel": data_ch,
+        "v4_channel": v4_ch,
+        "note": "Restart required for changes to take effect",
+    })
+
+
 @router.post("/actions/broadcast")
 async def trigger_broadcast(request: Request) -> JSONResponse:
     """Manually trigger a scheduler tick — runs any jobs whose interval

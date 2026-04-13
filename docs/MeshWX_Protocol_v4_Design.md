@@ -1,6 +1,6 @@
 # MeshWX Protocol v4 Design
 
-> **Status: partially implemented.** New v4 products (FWF, RTP, NOW, SFT, SPC WOU/SEL, QPF) have parsers, wire encoders, and scheduler integration. The v4 frame header, FEC system, discovery beacon, and multi-bot support are still design-only. The current v3 system continues operating on existing channels.
+> **Status: partially implemented.** The v4 frame header (6-byte wrapper with sequence numbers) and dual-broadcast are implemented — the scheduler sends every product on both v3 and v4 channels simultaneously. New v4 products (FWF, RTP, NOW, SFT, SPC WOU/SEL, QPF) have parsers, wire encoders, and scheduler integration. Channel configuration is available in the portal System section. Still design-only: FEC/XOR parity, discovery beacon, and multi-bot support.
 
 ---
 

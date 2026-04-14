@@ -333,13 +333,15 @@ def build_fec_radar_messages(
 
         # Base layer: downsample 64→32 (max-pool to preserve storm cores)
         grid_32 = _downsample_grid(grid_64, 64, 32)
+        # Base layer is excluded from parity so its MTU constraint is
+        # looser: v3 + 5(v4) + 1(COBS) ≤ 137 → v3 ≤ 131.
         base_msgs = pack_radar_compressed(
             region_id=region_id,
             timestamp_utc_min=timestamp_utc_min,
             scale_km=region["scale"],
             grid=grid_32,
             grid_size=32,
-            max_msg_size=_FEC_MAX_V3_SIZE,
+            max_msg_size=131,
         )
         # Base layer is usually a single message; take the first
         base_msg = base_msgs[0] if base_msgs else None

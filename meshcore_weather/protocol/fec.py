@@ -52,17 +52,6 @@ def _pack_fec_flags(
     return flags
 
 
-def _unpack_fec_flags(flags: int) -> dict:
-    """Unpack FEC flag bits from a v4 frame's msg_flags byte."""
-    return {
-        "is_unit": bool(flags & FEC_FLAG_IS_UNIT),
-        "is_parity": bool(flags & FEC_FLAG_IS_PARITY),
-        "is_base": bool(flags & FEC_FLAG_IS_BASE),
-        "group_id": (flags >> 3) & 0x03,
-        "unit_index": (flags >> 5) & 0x07,
-    }
-
-
 # -- XOR parity computation and recovery --
 
 
@@ -91,39 +80,6 @@ def xor_parity(payloads: list[bytes]) -> tuple[bytes, list[int]]:
             parity[i] ^= b
 
     return bytes(parity), length_map
-
-
-def recover_unit(
-    received: dict[int, bytes],
-    parity: bytes,
-    length_map: list[int],
-    missing_index: int,
-) -> bytes:
-    """Recover a single missing unit using XOR parity.
-
-    Args:
-      received: dict mapping unit_index → payload for all received units
-                (excluding the missing one and excluding the parity)
-      parity: the parity payload
-      length_map: original lengths of each unit (from the parity message)
-      missing_index: which unit index is missing (0-based into the data units)
-
-    Returns:
-      The recovered payload, truncated to its original length.
-    """
-    max_len = len(parity)
-
-    # Start with parity, XOR in all received units
-    recovered = bytearray(parity)
-    for idx, payload in received.items():
-        if idx == missing_index:
-            continue
-        for i in range(min(len(payload), max_len)):
-            recovered[i] ^= payload[i]
-
-    # Truncate to original length
-    orig_len = length_map[missing_index] if missing_index < len(length_map) else max_len
-    return bytes(recovered[:orig_len])
 
 
 # -- FEC group assembly (sender side) --
@@ -219,26 +175,3 @@ def _v4_frame(
     return header + v3_msg[1:]
 
 
-# -- FEC group reception (receiver side) --
-
-
-def fec_parse_parity_payload(parity_payload: bytes) -> tuple[bytes, list[int]]:
-    """Parse a parity unit's payload into (xor_data, length_map).
-
-    Parity payload format:
-      byte 0: unit_count (number of entries in length_map)
-      bytes 1..: uint16 BE per unit (original payload length)
-      remaining: XOR parity data
-    """
-    if len(parity_payload) < 1:
-        return b"", []
-    count = parity_payload[0]
-    offset = 1
-    length_map: list[int] = []
-    for _ in range(count):
-        if offset + 2 > len(parity_payload):
-            break
-        length_map.append(struct.unpack_from(">H", parity_payload, offset)[0])
-        offset += 2
-    xor_data = parity_payload[offset:]
-    return xor_data, length_map

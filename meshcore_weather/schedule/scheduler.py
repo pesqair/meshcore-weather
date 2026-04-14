@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 # Delay between consecutive LoRa transmissions (seconds) — avoid bursting
 # many messages onto the channel within the same airtime window
-TX_SPACING = 2
+TX_SPACING = 4
 
 # How often the scheduler tick() runs. Not the same as a job's interval —
 # the tick is how often we CHECK for due jobs. A job with a 60-min interval

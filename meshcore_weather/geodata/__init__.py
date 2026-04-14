@@ -226,6 +226,14 @@ class LocationResolver:
             "lon": lon,
         }
 
+    def resolve_by_place_index(self, idx: int) -> dict | None:
+        """Resolve a place index to zone info (for LOC_PLACE requests)."""
+        self.load()
+        if idx < 0 or idx >= len(self._places):
+            return None
+        p = self._places[idx]
+        return self.resolve_by_coords(p[2], p[3])
+
     def resolve_by_coords(self, lat: float, lon: float) -> dict | None:
         """Resolve GPS coordinates to zone info (for location-aware DM)."""
         self.load()

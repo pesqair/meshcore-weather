@@ -351,14 +351,14 @@ class MeshWXBroadcaster:
             loc_id = loc.get("station", "")
         elif loc_type == LOC_PFM_POINT:
             loc_id = loc.get("pfm_point_id", 0)
+        elif loc_type == LOC_PLACE:
+            loc_id = loc.get("place_id", 0)
         elif loc_type == LOC_WFO:
             loc_id = loc.get("wfo", "")
         elif loc_type == LOC_LATLON:
             loc_id = (loc.get("lat", 0.0), loc.get("lon", 0.0))
         else:
-            # LOC_PLACE or unknown — use zero-valued placeholder so pack
-            # never raises. Client still gets enough info to correlate
-            # via data_type + reason.
+            # Unknown — use zero-valued placeholder so pack never raises.
             loc_type = LOC_ZONE
             loc_id = "AKZ000"  # minimal valid zone code
         try:
@@ -396,6 +396,8 @@ class MeshWXBroadcaster:
             return f"station:{loc.get('station')}"
         if t == LOC_PFM_POINT:
             return f"pfm:{loc.get('pfm_point_id')}"
+        if t == LOC_PLACE:
+            return f"place:{loc.get('place_id')}"
         return str(loc)
 
     def _location_to_query_string(self, loc: dict) -> str | None:
@@ -420,6 +422,12 @@ class MeshWXBroadcaster:
                 logger.debug("PFM point index %s out of range (0..%d)", idx, len(points))
                 return None
             return points[idx].get("zone")
+        if t == LOC_PLACE:
+            # Resolve place index to zone info via geodata
+            resolved = resolver.resolve_by_place_index(loc.get("place_id", -1))
+            if resolved and resolved.get("zones"):
+                return resolved["zones"][0]
+            return None
         return None
 
     def _build_observation(self, loc: dict, query: str) -> bytes | None:
@@ -433,12 +441,16 @@ class MeshWXBroadcaster:
         if not resolved:
             return None
 
-        # For PFM point requests, respond with LOC_PLACE so the client
-        # gets a proper city name from places.json.  Use the PFM point's
-        # own lat/lon (not the zone centroid) to find the nearest place.
+        # For LOC_PLACE requests, echo back the exact place_id from the
+        # request so the client displays the correct city name.
+        # For LOC_PFM_POINT, resolve the PFM point's coords to nearest place.
         resp_loc_type = None
         resp_loc_id = None
-        if loc.get("type") == LOC_PFM_POINT:
+        loc_type = loc.get("type")
+        if loc_type == LOC_PLACE:
+            resp_loc_type = LOC_PLACE
+            resp_loc_id = loc.get("place_id")
+        elif loc_type == LOC_PFM_POINT:
             idx = loc.get("pfm_point_id")
             points = self._scheduler._pfm_points
             if idx is not None and 0 <= idx < len(points):
@@ -504,11 +516,14 @@ class MeshWXBroadcaster:
             return None
         zone = zones[0]
 
-        # If this was a LOC_PFM_POINT request, pass the PFM point ID through
-        # to the encoder so the response echoes the requested location type.
+        # Echo back the client's location type so it can correlate responses.
         resp_loc_type = None
         resp_loc_id = None
-        if loc.get("type") == LOC_PFM_POINT:
+        loc_type = loc.get("type")
+        if loc_type == LOC_PLACE:
+            resp_loc_type = LOC_PLACE
+            resp_loc_id = loc.get("place_id")
+        elif loc_type == LOC_PFM_POINT:
             resp_loc_type = LOC_PFM_POINT
             resp_loc_id = loc.get("pfm_point_id")
 

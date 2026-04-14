@@ -434,14 +434,16 @@ class MeshWXBroadcaster:
             return None
 
         # For PFM point requests, respond with LOC_PLACE so the client
-        # gets a proper city name from places.json.
+        # gets a proper city name from places.json.  Use the PFM point's
+        # own lat/lon (not the zone centroid) to find the nearest place.
         resp_loc_type = None
         resp_loc_id = None
         if loc.get("type") == LOC_PFM_POINT:
-            lat = resolved.get("lat")
-            lon = resolved.get("lon")
-            if lat is not None and lon is not None:
-                place_idx = resolver.find_place_index(lat, lon)
+            idx = loc.get("pfm_point_id")
+            points = self._scheduler._pfm_points
+            if idx is not None and 0 <= idx < len(points):
+                pt = points[idx]
+                place_idx = resolver.find_place_index(pt["lat"], pt["lon"])
                 if place_idx is not None:
                     resp_loc_type = LOC_PLACE
                     resp_loc_id = place_idx
